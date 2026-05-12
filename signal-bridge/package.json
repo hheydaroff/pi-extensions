@@ -1,0 +1,11 @@
+{
+  "name": "signal-bridge",
+  "version": "1.0.0",
+  "description": "Pi extension that bridges Signal messenger to the pi coding agent",
+  "main": "index.ts",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.49",
+    "signal-sdk": "0.2.3",
+    "whisper-onnx-speech-to-text": "1.0.1"
+  }
+}
