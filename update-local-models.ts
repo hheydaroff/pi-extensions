@@ -119,6 +119,7 @@ function buildEntry(id: string, template?: ModelEntry): ModelEntry {
 type Plan = {
   provider: string;
   missing: string[];
+  removed?: string[];
   error?: string;
   scanned: boolean;
 };
@@ -140,11 +141,15 @@ async function scan(
     try {
       const reported = await fetchModelIds(provider, signal);
       const missing = reported.filter((id) => !existing.has(id));
-      plans.push({ provider: name, missing, scanned: true });
+      const removed = provider.models
+        .filter((m) => !reported.includes(m.id))
+        .map((m) => m.id);
+      plans.push({ provider: name, missing, removed, scanned: true });
     } catch (err) {
       plans.push({
         provider: name,
         missing: [],
+        removed: [],
         scanned: false,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -153,20 +158,36 @@ async function scan(
   return plans;
 }
 
-function applyPlans(file: ModelsFile, plans: Plan[]): number {
+function applyPlans(file: ModelsFile, plans: Plan[]): { added: number; removed: number } {
   let added = 0;
+  let removed = 0;
   const providers = file.providers ?? {};
   for (const plan of plans) {
-    if (!plan.scanned || plan.missing.length === 0) continue;
-    const provider = providers[plan.provider];
-    if (!provider?.models) continue;
-    const template = provider.models[0];
-    for (const id of plan.missing) {
-      provider.models.push(buildEntry(id, template));
-      added++;
+    if (!plan.scanned) continue;
+
+    // Add missing models
+    if (plan.missing.length > 0) {
+      const provider = providers[plan.provider];
+      if (provider?.models) {
+        const template = provider.models[0];
+        for (const id of plan.missing) {
+          provider.models.push(buildEntry(id, template));
+          added++;
+        }
+      }
+    }
+
+    // Remove stale models no longer reported by the server
+    if (plan.removed?.length > 0) {
+      const provider = providers[plan.provider];
+      if (provider?.models) {
+        const before = provider.models.length;
+        provider.models = provider.models.filter((m) => !plan.removed.includes(m.id));
+        removed += before - provider.models.length;
+      }
     }
   }
-  return added;
+  return { added, removed };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -200,11 +221,15 @@ export default function (pi: ExtensionAPI) {
       for (const p of plans) {
         if (!p.scanned) {
           lines.push(`✗ ${p.provider}: unreachable (${p.error})`);
-        } else if (p.missing.length === 0) {
+        } else if (p.missing.length === 0 && !p.removed?.length) {
           lines.push(`✓ ${p.provider}: up to date`);
         } else {
-          lines.push(`+ ${p.provider}: ${p.missing.length} new`);
-          for (const id of p.missing) lines.push(`    • ${id}`);
+          const parts: string[] = [];
+          if (p.missing.length > 0) parts.push(`${p.missing.length} new`);
+          if (p.removed?.length > 0) parts.push(`${p.removed.length} removed`);
+          lines.push(`+ ${p.provider}: ${parts.join(", ")}`);
+          for (const id of p.missing) lines.push(`    • + ${id}`);
+          for (const id of p.removed ?? []) lines.push(`    • − ${id}`);
         }
       }
 
@@ -217,23 +242,31 @@ export default function (pi: ExtensionAPI) {
       }
 
       const totalMissing = plans.reduce((n, p) => n + p.missing.length, 0);
+      const totalRemoved = plans.reduce((n, p) => n + (p.removed?.length ?? 0), 0);
+      const totalChanges = totalMissing + totalRemoved;
 
-      if (totalMissing === 0) {
+      if (totalChanges === 0) {
         ctx.ui.notify(`All local models up to date.\n${lines.join("\n")}`, "info");
         return;
       }
 
       if (checkOnly) {
+        const parts: string[] = [];
+        if (totalMissing > 0) parts.push(`${totalMissing} new`);
+        if (totalRemoved > 0) parts.push(`${totalRemoved} removed`);
         ctx.ui.notify(
-          `${totalMissing} new model(s) available (check only):\n${lines.join("\n")}`,
+          `${parts.join(" + ")} available (check only):\n${lines.join("\n")}`,
           "info",
         );
         return;
       }
 
       if (ctx.hasUI) {
+        const parts: string[] = [];
+        if (totalMissing > 0) parts.push(`${totalMissing} new`);
+        if (totalRemoved > 0) parts.push(`${totalRemoved} removed`);
         const ok = await ctx.ui.confirm(
-          `Add ${totalMissing} new model(s) to models.json?`,
+          `Sync ${parts.join(" + ")} models in models.json?`,
           lines.join("\n"),
         );
         if (!ok) {
@@ -248,12 +281,15 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // non-fatal
       }
-      const added = applyPlans(file, plans);
+      const { added, removed } = applyPlans(file, plans);
       writeFileSync(MODELS_PATH, JSON.stringify(file, null, 2) + "\n", "utf8");
       ctx.modelRegistry.refresh();
 
+      const summary: string[] = [];
+      if (added > 0) summary.push(`added ${added}`);
+      if (removed > 0) summary.push(`removed ${removed}`);
       ctx.ui.notify(
-        `Added ${added} model(s) to models.json (backup: models.json.bak).`,
+        `Synced models.json (${summary.join(", ") || "no changes"}; backup: models.json.bak).`,
         "success",
       );
     },
