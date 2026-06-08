@@ -1,5 +1,7 @@
 node_modules/
 .DS_Store
+pi-session-*.html
+*.html
 *.json.bak
 signal-bridge.json
 .signal-cli/
