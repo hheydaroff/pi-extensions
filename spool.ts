@@ -40,7 +40,7 @@ import type {
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -59,7 +59,11 @@ const ROOT = join(homedir(), ".pi", "agent", "spool");
 const DB_PATH = join(ROOT, "index.db");
 
 const TRIGGER_BYTES = 6 * 1024; // 6 KB
-const TRIGGER_LINES = 80; // must also be line-oriented
+const TRIGGER_LINES = 80; // line-oriented trigger
+const LONG_LINE_BYTES = 2048; // single-line/blob trigger (minified, base64, one-line logs)
+const HARD_CEILING_BYTES = 12 * 1024; // always intercept above this, regardless of shape
+const JSON_GUARD_CEILING = 32 * 1024; // leave structured payloads intact only below this
+const MAX_CAPTURE_BYTES = 25 * 1024 * 1024; // above this: store to disk but skip FTS indexing
 const HEAD_LINES = 20;
 const TAIL_LINES = 20;
 const CHUNK_BYTES = 1500;
@@ -263,10 +267,18 @@ function capture(
          (ref, session, tool, label, bytes, lines, path, created)
          VALUES (?,?,?,?,?,?,?,?)`,
       ).run(ref, meta.session, meta.tool, meta.label, bytes, lines, path, meta.created);
-      const ins = db.prepare(
-        `INSERT INTO chunks(ref, label, source, body) VALUES (?,?,?,?)`,
-      );
-      for (const c of chunkText(text)) ins.run(ref, meta.label, opts.tool, c);
+      // Skip FTS chunking for pathologically large captures — the .out file is
+      // still written so spool_get retrieval stays intact; only keyword search
+      // is unavailable above the cap.
+      if (bytes <= MAX_CAPTURE_BYTES) {
+        // Clear any stale chunks first (guards against a rare ref collision
+        // leaving orphaned rows that point at overwritten content).
+        db.prepare(`DELETE FROM chunks WHERE ref = ?`).run(ref);
+        const ins = db.prepare(
+          `INSERT INTO chunks(ref, label, source, body) VALUES (?,?,?,?)`,
+        );
+        for (const c of chunkText(text)) ins.run(ref, meta.label, opts.tool, c);
+      }
     } catch {
       /* indexing is best-effort */
     }
@@ -313,7 +325,7 @@ function search(query: string, label: string | undefined, limit: number): Search
   try {
     const res = spawnSync(
       "rg",
-      ["--no-heading", "--with-filename", "--max-count", "3", "-i", query, ROOT],
+      ["--no-heading", "--with-filename", "--fixed-strings", "--max-count", "3", "-i", query, ROOT],
       { encoding: "utf-8", maxBuffer: MAX_BUFFER },
     );
     const lines = (res.stdout || "").split("\n").filter(Boolean).slice(0, limit);
@@ -375,6 +387,22 @@ function pruneOldCaptures(): void {
         const st = statSync(dir);
         if (st.isDirectory() && now - st.mtimeMs > TTL_MS) {
           rmSync(dir, { recursive: true, force: true });
+          // Keep the FTS index in lockstep with on-disk captures: drop rows
+          // for the expired session so search never returns dead refs and the
+          // DB doesn't grow unbounded.
+          if (sqliteOk && db) {
+            try {
+              const refs = db
+                .prepare(`SELECT ref FROM captures WHERE session = ?`)
+                .all(entry)
+                .map((r: any) => r.ref);
+              const delChunk = db.prepare(`DELETE FROM chunks WHERE ref = ?`);
+              for (const ref of refs) delChunk.run(ref);
+              db.prepare(`DELETE FROM captures WHERE session = ?`).run(entry);
+            } catch {
+              /* best-effort index cleanup */
+            }
+          }
         }
       } catch {
         /* ignore individual dir errors */
@@ -401,14 +429,119 @@ function textOf(blocks: { type: string; text?: string }[]): string {
   return blocks
     .filter((b) => b.type === "text" && typeof b.text === "string")
     .map((b) => b.text as string)
-    .join("");
+    .join("\n");
 }
 
 function headTail(text: string): string {
   const lines = text.split("\n");
+  // Few lines but large bytes => a giant single/long-line blob. Line slicing
+  // would overlap head and tail and show the whole thing. Window by bytes.
+  if (lines.length <= HEAD_LINES + TAIL_LINES) {
+    const W = 1024;
+    if (Buffer.byteLength(text) > W * 2) {
+      return (
+        `──── first ${W} chars (${lines.length} long line(s)) ────\n${text.slice(0, W)}\n\n` +
+        `──── last ${W} chars ────\n${text.slice(-W)}`
+      );
+    }
+    return text;
+  }
   const head = lines.slice(0, HEAD_LINES).join("\n");
   const tail = lines.slice(-TAIL_LINES).join("\n");
   return `──── head (${HEAD_LINES} lines) ────\n${head}\n\n──── tail (${TAIL_LINES} lines) ────\n${tail}`;
+}
+
+// ─── Async process runner ────────────────────────────────────────────────
+
+interface RunResult {
+  stdout: string;
+  stderr: string;
+  exit: number;
+  timedOut: boolean;
+  truncated: boolean;
+  spawnErr?: Error;
+}
+
+/**
+ * Run a child process without blocking the event loop (unlike spawnSync).
+ * Honors an AbortSignal, enforces a timeout, caps captured bytes, and kills the
+ * whole process group so backgrounded grandchildren don't survive.
+ */
+function runAsync(
+  bin: string,
+  args: string[],
+  opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal },
+): Promise<RunResult> {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(bin, args, { detached: true }); // own process group for tree-kill
+    } catch (e: any) {
+      resolve({ stdout: "", stderr: "", exit: -1, timedOut: false, truncated: false, spawnErr: e });
+      return;
+    }
+    let out = "";
+    let err = "";
+    let outBytes = 0;
+    let errBytes = 0;
+    let truncated = false;
+    let timedOut = false;
+    let settled = false;
+
+    const killTree = () => {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }
+    };
+    const finish = (r: RunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
+      resolve(r);
+    };
+    const onAbort = () => {
+      timedOut = true; // surface cancellation like a timeout
+      killTree();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree();
+    }, opts.timeoutMs);
+
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        onAbort();
+      } else {
+        opts.signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+
+    child.stdout?.on("data", (d: Buffer) => {
+      if (outBytes >= opts.maxBytes) return;
+      out += d.toString("utf-8");
+      outBytes += d.length;
+      if (outBytes >= opts.maxBytes) {
+        truncated = true;
+        killTree();
+      }
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      if (errBytes >= opts.maxBytes) return;
+      err += d.toString("utf-8");
+      errBytes += d.length;
+    });
+    child.on("error", (e: Error) =>
+      finish({ stdout: out, stderr: err, exit: -1, timedOut, truncated, spawnErr: e }),
+    );
+    child.on("close", (code: number | null) =>
+      finish({ stdout: out, stderr: err, exit: code ?? -1, timedOut, truncated }),
+    );
+  });
 }
 
 // ─── Extension ──────────────────────────────────────────────────────────────
@@ -417,12 +550,20 @@ export default function (pi: ExtensionAPI) {
   initDb();
 
   // ── Soft routing guidance ────────────────────────────────────────────────
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    const on = interceptEnabled(ctx);
+    // Only advertise automatic spooling when the interceptor is actually on,
+    // otherwise the model is told a guarantee that isn't active and may
+    // under-fetch large output.
+    const autoLine = on
+      ? `Large tool/command output is automatically spooled out of context and replaced
+with a pointer (ref) plus head/tail. To work with spooled or large data:`
+      : `The automatic output interceptor is currently OFF (large output passes through
+untouched). These manual tools are still available:`;
     const injection = `
 ## Spool (context-saving output capture)
 
-Large tool/command output is automatically spooled out of context and replaced
-with a pointer (ref) plus head/tail. To work with spooled or large data:
+${autoLine}
 
 - Use **spool_run** to execute a script and return only the result you need
   (stdout/tail/summary), instead of running a command whose full output floods
@@ -505,12 +646,28 @@ with a pointer (ref) plus head/tail. To work with spooled or large data:
       if (!text) return;
 
       const bytes = Buffer.byteLength(text);
-      const lineCount = text.split("\n").length;
-      // Gate: large AND line-oriented.
-      if (bytes < TRIGGER_BYTES || lineCount < TRIGGER_LINES) return;
-      // Conservative JSON guard: leave structured payloads intact.
+      const lines = text.split("\n");
+      const lineCount = lines.length;
+      let maxLineLen = 0;
+      for (const ln of lines) if (ln.length > maxLineLen) maxLineLen = ln.length;
+      // Gate: large AND (line-oriented OR a long-line/blob payload). The blob
+      // arm catches minified JS, base64, and one-line logs that the old
+      // line-count-only gate let flood context.
+      if (bytes < TRIGGER_BYTES) return;
+      // Trigger when line-oriented, a long-line/blob payload, OR simply large
+      // enough that shape no longer matters (wide-but-short output that hits
+      // neither of the first two arms still floods context).
+      if (
+        lineCount < TRIGGER_LINES &&
+        maxLineLen < LONG_LINE_BYTES &&
+        bytes < HARD_CEILING_BYTES
+      )
+        return;
+      // Conservative JSON guard: leave structured payloads intact, but only
+      // below a ceiling — a huge JSON blob should still be spooled (the model
+      // can spool_get/spool_search it) rather than flood context.
       const t = text.trimStart();
-      if (t.startsWith("{") || t.startsWith("[")) return;
+      if ((t.startsWith("{") || t.startsWith("[")) && bytes < JSON_GUARD_CEILING) return;
 
       const meta = capture(text, {
         tool: event.toolName,
@@ -518,9 +675,16 @@ with a pointer (ref) plus head/tail. To work with spooled or large data:
         index: true,
       });
 
+      const hiddenStart = HEAD_LINES + 1;
+      const hiddenEnd = lineCount - TAIL_LINES;
+      const shownNote =
+        hiddenEnd >= hiddenStart
+          ? `\u26A0\uFE0F Showing head (lines 1-${HEAD_LINES}) + tail (last ${TAIL_LINES}) only — lines ${hiddenStart}-${hiddenEnd} are NOT shown. ` +
+            `If your conclusion depends on content beyond what's shown, you MUST spool_search/spool_get this ref before concluding.`
+          : `\u26A0\uFE0F Output windowed to keep context lean — spool_get this ref for the full content.`;
       const pointer =
-        `[spool] ${event.toolName} output: ${(bytes / 1024).toFixed(1)} KB, ${lineCount} lines — ` +
-        `truncated to keep context lean.\n` +
+        `[spool] ${event.toolName} output: ${(bytes / 1024).toFixed(1)} KB, ${lineCount} lines.\n` +
+        `${shownNote}\n` +
         `ref: ${meta.ref}  (spool_get ref:"${meta.ref}" for slices · spool_search query:"…")\n\n` +
         headTail(text);
 
@@ -540,18 +704,21 @@ with a pointer (ref) plus head/tail. To work with spooled or large data:
     name: "spool_run",
     label: "Spool Run",
     description:
-      "Execute a script (bash/javascript/python) and return only the result you ask for, " +
+      "Execute a bash script and return only the result you ask for, " +
       "keeping full output out of context. Compute the answer in the script and print only that.",
-    promptSnippet: "Run a script and return only stdout/tail/summary (context-saving)",
+    promptSnippet: "Run a bash script and return only stdout/tail/summary (context-saving)",
     promptGuidelines: [
       "Prefer spool_run over bash when a command may produce large output and you only need a computed result.",
       "Print only the answer from your script (think in code) instead of dumping raw data.",
       "Use return:'summary' for logs/build output, return:'tail' for the last N lines, return:'ref' to defer to spool_search.",
     ],
     parameters: Type.Object({
-      lang: Type.Union([Type.Literal("bash"), Type.Literal("javascript"), Type.Literal("python")], {
-        description: "Interpreter for the script.",
-      }),
+      lang: Type.Optional(
+        Type.Union([Type.Literal("bash"), Type.Literal("javascript"), Type.Literal("python")], {
+          description:
+            "Only 'bash' is supported. To run Python/Node, call them from bash (e.g. `uv run python ...`) so they go through the managed toolchain.",
+        }),
+      ),
       code: Type.String({ description: "Script source to execute." }),
       return: Type.Optional(
         Type.Union(
@@ -570,28 +737,79 @@ with a pointer (ref) plus head/tail. To work with spooled or large data:
     }),
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { lang, code } = params;
+      const lang = params.lang ?? "bash";
       const mode = params.return || "stdout";
       const tailN = params.tail_lines ?? 40;
+      const code = params.code;
 
-      const cmd =
-        lang === "bash"
-          ? { bin: "bash", args: ["-c", code] }
-          : lang === "javascript"
-            ? { bin: "node", args: ["--input-type=module", "-e", code] }
-            : { bin: "python3", args: ["-c", code] };
+      // Bash-only. Python/Node must be invoked from bash so they pass through the
+      // uv-managed toolchain (PATH shim) and the security gate, not a bare spawn.
+      if (lang !== "bash") {
+        const how =
+          lang === "python"
+            ? "  uv run python -c '...'   (or: uv run python script.py)"
+            : "  node -e '...'            (or: node script.js)";
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `spool_run is bash-only. To run ${lang === "python" ? "Python" : "Node"}, call it from bash so it goes through the managed toolchain:\n` +
+                `${how}\nThen re-call spool_run with lang="bash" and that command in code.`,
+            },
+          ],
+          details: { rejected: lang },
+          isError: true,
+        };
+      }
 
-      const res = spawnSync(cmd.bin, cmd.args, {
-        encoding: "utf-8",
-        timeout: RUN_TIMEOUT_MS,
-        maxBuffer: MAX_BUFFER,
+      // Guard against python invocations that bypass the uv PATH shim, mirroring
+      // uv.ts. (Bare `python3`/`python` are fine — the PATH prefix below routes
+      // them through the shim → uv.) Keep these patterns in sync with uv.ts.
+      const bypass =
+        /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)python(?:3(?:\.\d+)?)?\b/m.test(code) ||
+        /(?:^|\n|[;|&]{1,2})\s*python3\.\d+\b/m.test(code) ||
+        /(?:^|\n|[;|&]{1,2})\s*(?:\.?\/)?[^\s;|&]*\.py\b/m.test(code);
+      if (bypass) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Blocked: this runs Python via an explicit path, a version-suffixed name, or a .py file directly, which bypasses uv.\n" +
+                "Use plain `python3 ...` or `uv run python ...` in the bash code instead.",
+            },
+          ],
+          details: { blocked: "python-bypasses-uv" },
+          isError: true,
+        };
+      }
+
+      // Route bash through the uv intercepted-commands shim so any python/pip/
+      // poetry inside the script is redirected to uv (same prefix uv.ts uses).
+      const intercepted = join(homedir(), ".pi", "agent", "intercepted-commands");
+      const wrapped = `export PATH="${intercepted}:$PATH"\n${code}`;
+
+      const res = await runAsync("bash", ["-c", wrapped], {
+        timeoutMs: RUN_TIMEOUT_MS,
+        maxBytes: MAX_BUFFER,
+        signal: _signal,
       });
 
-      const stdout = res.stdout || "";
-      const stderr = res.stderr || "";
-      const combined = stdout + (stderr ? `\n──── stderr ────\n${stderr}` : "");
-      const timedOut = (res as any).signal === "SIGTERM" && res.status === null;
-      const exit = res.status ?? -1;
+      const stdout = res.stdout;
+      const stderr = res.stderr;
+      const spawnErr = res.spawnErr;
+      let combined = stdout + (stderr ? `\n──── stderr ────\n${stderr}` : "");
+      if (res.truncated) {
+        combined += `${combined ? "\n" : ""}──── output truncated at ${fmtBytes(MAX_BUFFER)} ────`;
+      }
+      if (spawnErr) {
+        // e.g. interpreter not on PATH. Without this the run looked like an
+        // empty success and the agent reasoned over nothing.
+        combined += `${combined ? "\n" : ""}──── spawn error ────\n${spawnErr.message}`;
+      }
+      const timedOut = res.timedOut;
+      const exit = res.exit;
 
       const bytes = Buffer.byteLength(combined);
       const lineCount = combined.split("\n").length;
@@ -605,7 +823,7 @@ with a pointer (ref) plus head/tail. To work with spooled or large data:
       });
 
       const header =
-        `exit=${exit}${timedOut ? " (TIMEOUT)" : ""} · ${(bytes / 1024).toFixed(1)} KB · ${lineCount} lines · ref=${meta.ref}`;
+        `exit=${exit}${timedOut ? " (TIMEOUT)" : ""}${spawnErr ? " (SPAWN-FAILED)" : ""} · ${(bytes / 1024).toFixed(1)} KB · ${lineCount} lines · ref=${meta.ref}`;
 
       let body: string;
       switch (mode) {
@@ -629,8 +847,12 @@ with a pointer (ref) plus head/tail. To work with spooled or large data:
 
       return {
         content: [{ type: "text", text: body }],
-        details: { ref: meta.ref, exit, bytes, lines: lineCount, timedOut, indexed: doIndex },
-        isError: exit !== 0 && exit !== -1 ? false : timedOut, // surface timeout as error
+        details: { ref: meta.ref, exit, bytes, lines: lineCount, timedOut, spawnError: spawnErr?.message, indexed: doIndex },
+        // Flag the genuinely broken cases (timeout, spawn failure such as a
+        // missing interpreter). A non-zero exit is left for the agent to read
+        // from the header, since grep/test-runner exit codes are routinely
+        // non-zero and benign.
+        isError: timedOut || !!spawnErr,
       };
     },
   });
