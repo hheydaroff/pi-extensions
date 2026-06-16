@@ -562,8 +562,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ── BASH ─────────────────────────────────────────────────────────────────
-		if (isToolCallEventType("bash", event)) {
-			const cmd = event.input.command as string;
+		// Shared command gate — used by the bash tool and by spool_run code execution.
+		const checkCommandRules = async (toolName: string, cmd: string, full: boolean): Promise<{ block: true; reason: string } | undefined> => {
 
 			// Fast-path bypass: if command matches any allowed pattern, skip all checks
 			if (compiled.bash.allowed.some(re => re.test(cmd))) {
@@ -576,13 +576,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// CWD boundary check for bash — extract path-like tokens
-			if (compiled.boundary.enabled) {
+			if (full && compiled.boundary.enabled) {
 				// Simple heuristic: extract tokens that look like paths
 				const tokens = cmd.match(/"([^"]+)"|'([^']+)'|([^\s"'`<>|;&]+)/g) ?? [];
 				for (const raw of tokens) {
 					const token = raw.replace(/^["']|["']$/g, "");
 					if (!token || token.startsWith("-") || !looksLikePath(token)) continue;
-					const result = await checkBoundary("bash", token, ctx.cwd, ctx);
+					const result = await checkBoundary(toolName, token, ctx.cwd, ctx);
 					if (result) return result;
 				}
 			}
@@ -592,8 +592,8 @@ export default function (pi: ExtensionAPI) {
 				if (ruleApplies(cmd, rule)) {
 					ctx.ui.notify(`🛑 Security: Blocked access to zero-access path (${rule.description})`, "error");
 					ctx.ui.setStatus("security", `⚠️ ${rule.description}`);
-					log({ tool: "bash", input: cmd, rule: rule.description, category: "paths.zeroAccess", action: "blocked" });
-					emitBlocked("bash", cmd, rule.description, "paths.zeroAccess");
+					log({ tool: toolName, input: cmd, rule: rule.description, category: "paths.zeroAccess", action: "blocked" });
+					emitBlocked(toolName, cmd, rule.description, "paths.zeroAccess");
 					ctx.abort();
 					return { block: true, reason: blockReason(rule.description, rule.guidance) };
 				}
@@ -604,8 +604,8 @@ export default function (pi: ExtensionAPI) {
 				if (ruleApplies(cmd, rule) && isWriteOperation(cmd)) {
 					ctx.ui.notify(`🛑 Security: Blocked write to read-only path (${rule.description})`, "error");
 					ctx.ui.setStatus("security", `⚠️ ${rule.description}`);
-					log({ tool: "bash", input: cmd, rule: rule.description, category: "paths.readOnly", action: "blocked" });
-					emitBlocked("bash", cmd, rule.description, "paths.readOnly");
+					log({ tool: toolName, input: cmd, rule: rule.description, category: "paths.readOnly", action: "blocked" });
+					emitBlocked(toolName, cmd, rule.description, "paths.readOnly");
 					ctx.abort();
 					return { block: true, reason: blockReason(rule.description, rule.guidance) };
 				}
@@ -616,8 +616,8 @@ export default function (pi: ExtensionAPI) {
 				if (ruleApplies(cmd, rule) && isDeleteOperation(cmd)) {
 					ctx.ui.notify(`🛑 Security: Blocked deletion of protected path (${rule.description})`, "error");
 					ctx.ui.setStatus("security", `⚠️ ${rule.description}`);
-					log({ tool: "bash", input: cmd, rule: rule.description, category: "paths.noDelete", action: "blocked" });
-					emitBlocked("bash", cmd, rule.description, "paths.noDelete");
+					log({ tool: toolName, input: cmd, rule: rule.description, category: "paths.noDelete", action: "blocked" });
+					emitBlocked(toolName, cmd, rule.description, "paths.noDelete");
 					ctx.abort();
 					return { block: true, reason: blockReason(rule.description, rule.guidance) };
 				}
@@ -628,8 +628,8 @@ export default function (pi: ExtensionAPI) {
 				if (ruleApplies(cmd, rule)) {
 					ctx.ui.notify(`🛑 Security: Prohibited — ${rule.description}`, "error");
 					ctx.ui.setStatus("security", `⚠️ ${rule.description}`);
-					log({ tool: "bash", input: cmd, rule: rule.description, category: "bash.prohibit", action: "blocked" });
-					emitBlocked("bash", cmd, rule.description, "bash.prohibit");
+					log({ tool: toolName, input: cmd, rule: rule.description, category: "bash.prohibit", action: "blocked" });
+					emitBlocked(toolName, cmd, rule.description, "bash.prohibit");
 					ctx.abort();
 					return { block: true, reason: blockReason(rule.description, rule.guidance) };
 				}
@@ -644,8 +644,8 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (!ctx.hasUI) {
-						log({ tool: "bash", input: cmd, rule: rule.description, category: "bash.ask", action: "blocked" });
-						emitBlocked("bash", cmd, rule.description, "bash.ask");
+						log({ tool: toolName, input: cmd, rule: rule.description, category: "bash.ask", action: "blocked" });
+						emitBlocked(toolName, cmd, rule.description, "bash.ask");
 						ctx.abort();
 						return { block: true, reason: blockReason(`${rule.description} (no UI to confirm)`, rule.guidance) };
 					}
@@ -656,17 +656,29 @@ export default function (pi: ExtensionAPI) {
 					);
 					if (!ok) {
 						ctx.ui.setStatus("security", `⚠️ Denied: ${rule.description}`);
-						log({ tool: "bash", input: cmd, rule: rule.description, category: "bash.ask", action: "blocked_by_user" });
-						emitBlocked("bash", cmd, rule.description, "bash.ask");
+						log({ tool: toolName, input: cmd, rule: rule.description, category: "bash.ask", action: "blocked_by_user" });
+						emitBlocked(toolName, cmd, rule.description, "bash.ask");
 						return { block: true, reason: blockReason(rule.description, rule.guidance) };
 					}
 					// Grant for session — approve this rule pattern for the rest of the session
 					sessionGrants.add(rule.pattern);
-					log({ tool: "bash", input: cmd, rule: rule.description, category: "bash.ask", action: "approved_by_user" });
+					log({ tool: toolName, input: cmd, rule: rule.description, category: "bash.ask", action: "approved_by_user" });
 					return undefined;
 				}
 			}
 
+			return undefined;
+		};
+
+		if (isToolCallEventType("bash", event)) {
+			return await checkCommandRules("bash", event.input.command as string, true);
+		}
+
+		if (event.toolName === "spool_run") {
+			const sp = event.input as { lang?: string; code?: string };
+			if (typeof sp?.code === "string" && sp.code.length > 0) {
+				return await checkCommandRules(`spool_run:${sp.lang ?? "?"}`, sp.code, sp.lang === "bash");
+			}
 			return undefined;
 		}
 
