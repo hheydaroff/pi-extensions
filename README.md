@@ -80,6 +80,6 @@ These extensions read config/secrets from outside the repo and are **not** commi
 
 ## License
 
-[MIT](LICENSE) © Hidayat Heydarov
+[MIT](LICENSE) © hheydaroff
 
 Use at your own risk — extensions run with your full system permissions.
