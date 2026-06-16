@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { spawn, execSync, ChildProcess } from "child_process";
 
 /**
@@ -16,7 +17,7 @@ import { spawn, execSync, ChildProcess } from "child_process";
  * Requires `mpv` or `ffplay` (ffmpeg) on PATH.
  */
 
-const STATUS_KEY = "radio-garden";
+const WIDGET_KEY = "radio-garden";
 const API = "https://radio.garden/api";
 const RG_HEADERS = {
   "User-Agent":
@@ -171,6 +172,33 @@ export default function (pi: ExtensionAPI) {
     return loc ? `${s.title} — ${loc}` : s.title;
   }
 
+  // Sticky left-aligned footer widget, shown only while a station is playing.
+  // Uses setWidget (not setStatus) so it stays visible even when another
+  // extension owns the footer via setFooter (e.g. tool-counter).
+  function showWidget(ctx: ExtensionContext, text: string) {
+    if (!ctx.hasUI) return;
+    ctx.ui.setWidget(
+      WIDGET_KEY,
+      (_tui, theme) => {
+        const line = new Text(
+          theme.fg("accent", "♪ ") + theme.fg("success", text),
+          0,
+          0,
+        );
+        return {
+          render: (width: number) => line.render(width),
+          invalidate: () => line.invalidate(),
+        };
+      },
+      { placement: "belowEditor" },
+    );
+  }
+
+  function clearWidget(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+    ctx.ui.setWidget(WIDGET_KEY, undefined);
+  }
+
   async function play(station: Station, ctx: ExtensionContext): Promise<boolean> {
     const cmd = detectPlayer();
     if (!cmd) {
@@ -194,20 +222,20 @@ export default function (pi: ExtensionAPI) {
     player.on("error", () => {
       ctx.ui.notify(`Playback error with ${cmd}.`, "error");
       stop();
-      ctx.ui.setStatus(STATUS_KEY, "");
+      clearWidget(ctx);
     });
     player.on("exit", () => {
       // Stream ended or dropped.
       player = null;
     });
 
-    ctx.ui.setStatus(STATUS_KEY, `♪ ${label(station)}`);
+    showWidget(ctx, label(station));
     ctx.ui.notify(`Now playing: ${label(station)}`, "info");
     return true;
   }
 
   async function playRandom(ctx: ExtensionContext): Promise<void> {
-    ctx.ui.setStatus(STATUS_KEY, "♪ tuning…");
+    showWidget(ctx, "tuning…");
     try {
       const places = await getPlaces();
       // Try a few random places until we find one with channels.
@@ -220,10 +248,10 @@ export default function (pi: ExtensionAPI) {
         }
       }
       ctx.ui.notify("Couldn't find a random station, try again.", "warning");
-      ctx.ui.setStatus(STATUS_KEY, "");
+      clearWidget(ctx);
     } catch (e: any) {
       ctx.ui.notify(`Random tune failed: ${e.message}`, "error");
-      ctx.ui.setStatus(STATUS_KEY, "");
+      clearWidget(ctx);
     }
   }
 
@@ -322,7 +350,7 @@ export default function (pi: ExtensionAPI) {
         break;
       case STOP:
         stop();
-        ctx.ui.setStatus(STATUS_KEY, "");
+        clearWidget(ctx);
         ctx.ui.notify("Radio stopped.", "info");
         break;
     }
@@ -354,7 +382,7 @@ export default function (pi: ExtensionAPI) {
         case "stop":
         case "disable":
           stop();
-          ctx.ui.setStatus(STATUS_KEY, "");
+          clearWidget(ctx);
           ctx.ui.notify("Radio stopped.", "info");
           break;
         case "search":
@@ -410,6 +438,6 @@ export default function (pi: ExtensionAPI) {
   // ---- cleanup ------------------------------------------------------------
   pi.on("session_shutdown", async (_event, ctx) => {
     stop();
-    ctx.ui.setStatus(STATUS_KEY, "");
+    clearWidget(ctx);
   });
 }
