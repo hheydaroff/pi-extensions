@@ -20,7 +20,7 @@
  * blocks disallowed invocations at bash spawn time.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -103,7 +103,71 @@ function getBlockedCommandMessage(command: string): string | null {
     ].join("\n");
   }
 
+  // Block python invoked via an explicit path (absolute or relative) or a
+  // version-suffixed name. Both skip the PATH shim and run a bare interpreter
+  // outside uv. (Bare `python`/`python3` are allowed — they resolve to the shim.)
+  const explicitPathPython =
+    /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)python(?:3(?:\.\d+)?)?\b/m;
+  const versionedPython = /(?:^|\n|[;|&]{1,2})\s*python3\.\d+\b/m;
+  if (explicitPathPython.test(command) || versionedPython.test(command)) {
+    return [
+      "Error: running Python via an explicit path or a version-suffixed name bypasses uv.",
+      "",
+      "  Use plain `python3 ...` (uv-managed via PATH), or be explicit through uv:",
+      "    uv run python script.py",
+      "    uv run --python 3.12 python script.py   # to pin a specific version",
+      "",
+    ].join("\n");
+  }
+
+  // Block direct execution of a .py file as the command (its shebang would run
+  // a bare interpreter). Only matches when the .py file is the command itself,
+  // not an argument (so `cat foo.py` and `python3 foo.py` stay allowed).
+  const directPyScript = /(?:^|\n|[;|&]{1,2})\s*(?:\.?\/)?[^\s;|&]*\.py\b/m;
+  if (directPyScript.test(command)) {
+    return [
+      "Error: executing a .py file directly bypasses uv (it runs via the script's shebang).",
+      "",
+      "  Run it through uv instead: uv run python path/to/script.py",
+      "",
+    ].join("\n");
+  }
+
   return null;
+}
+
+/**
+ * Detect missing-module failures in command output and return a nudge that
+ * tells the agent to re-run through uv with the package made available.
+ *
+ * The PATH shim lets bare `python3` route through `uv run`, but uv only manages
+ * the *interpreter* — it does not install third-party packages. So
+ * `python3 -m markitdown` (or `import markitdown`) runs in a clean base env and
+ * fails with a raw ModuleNotFoundError instead of a helpful "use uv" message.
+ * The extension can't pre-block this (it can't distinguish stdlib `-m` modules
+ * like json.tool/http.server from third-party ones), so we catch it after the
+ * fact and append actionable guidance.
+ */
+function getMissingModuleHint(text: string): string | null {
+  // `import foo` -> ModuleNotFoundError: No module named 'foo'
+  // `python -m foo` -> <interpreter>: No module named foo
+  const quoted = /ModuleNotFoundError: No module named ['"]([^'".]+)/;
+  const bare = /: No module named ([A-Za-z0-9_]+)/;
+  const match = text.match(quoted) ?? text.match(bare);
+  if (!match) return null;
+  const pkg = match[1];
+  if (!pkg) return null;
+
+  return [
+    "",
+    `\u26A0\uFE0F uv hint: module '${pkg}' is not available in the uv-managed base interpreter.`,
+    "Bare `python3` routes through uv but does NOT install third-party packages. Re-run with the package made available:",
+    "",
+    `  uv run --with ${pkg} python ...      # one-off, ephemeral env`,
+    `  uv add ${pkg}                        # add as a project dependency, then: uv run python ...`,
+    "",
+    "(The import/module name may differ from the PyPI package name; adjust if needed.)",
+  ].join("\n");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -120,4 +184,30 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool(bashTool);
+
+  // Append a uv nudge when a command fails due to a missing Python module.
+  pi.on("tool_result", async (event: ToolResultEvent) => {
+    try {
+      if (event.toolName !== bashTool.name) return;
+      const blocks = event.content as { type: string; text?: string }[];
+      const text = blocks
+        .filter((b) => b.type === "text" && typeof b.text === "string")
+        .map((b) => b.text as string)
+        .join("\n");
+      if (!text) return;
+
+      const hint = getMissingModuleHint(text);
+      if (!hint) return;
+      // Avoid double-appending if the hint is already present.
+      if (text.includes("uv hint: module")) return;
+
+      const kept = blocks.filter((b) => b.type !== "text");
+      return {
+        content: [...(kept as any), { type: "text", text: `${text}\n${hint}` }],
+      };
+    } catch {
+      // Fail-open: never lose output because of the hint.
+      return;
+    }
+  });
 }
