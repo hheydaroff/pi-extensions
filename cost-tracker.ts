@@ -11,8 +11,8 @@
  *    cacheRead, cacheWrite, totalTokens, sessionId, role}
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { appendFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -170,6 +170,172 @@ function buildReport(rows: Row[], win: string, byModel: boolean): string[] {
 	return lines;
 }
 
+// ── Interactive project browser: scroll projects, expand to per-model spend ──
+type ModelAgg = { name: string; provider: string; cost: number; tokens: number; msgs: number };
+type ProjAgg = {
+	key: string;
+	name: string;
+	detail: string;
+	cost: number;
+	month: number;
+	tokens: number;
+	msgs: number;
+	last: number;
+	models: ModelAgg[];
+};
+
+function buildProjectTree(rows: Row[], win: string): { header: string[]; projects: ProjAgg[] } {
+	const start = windowStart(win);
+	const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+	const groups = new Map<string, ProjAgg & { modelMap: Map<string, ModelAgg> }>();
+	let total = 0;
+	let totalMonth = 0;
+
+	for (const r of rows) {
+		if (r.ts < start) continue;
+		total += r.cost;
+		if (r.ts >= monthStart) totalMonth += r.cost;
+		let p = groups.get(r.cwd);
+		if (!p) {
+			p = {
+				key: r.cwd,
+				name: r.project || basename(r.cwd),
+				detail: r.cwd,
+				cost: 0,
+				month: 0,
+				tokens: 0,
+				msgs: 0,
+				last: 0,
+				models: [],
+				modelMap: new Map(),
+			};
+			groups.set(r.cwd, p);
+		}
+		p.cost += r.cost;
+		if (r.ts >= monthStart) p.month += r.cost;
+		p.tokens += r.totalTokens;
+		p.msgs += 1;
+		if (r.ts > p.last) p.last = r.ts;
+		const mKey = `${r.provider ?? "?"}/${r.model ?? "?"}`;
+		let m = p.modelMap.get(mKey);
+		if (!m) {
+			m = { name: r.model ?? "?", provider: r.provider ?? "", cost: 0, tokens: 0, msgs: 0 };
+			p.modelMap.set(mKey, m);
+		}
+		m.cost += r.cost;
+		m.tokens += r.totalTokens;
+		m.msgs += 1;
+	}
+
+	const projects = [...groups.values()].sort((a, b) => b.cost - a.cost);
+	for (const p of projects) p.models = [...p.modelMap.values()].sort((a, b) => b.cost - a.cost);
+
+	const label = win === "all" ? "all time" : win;
+	const header = [
+		`  AI spend by project — ${label}`,
+		`  total ${money(total)}   this month ${money(totalMonth)}   (log: ${LOG_PATH})`,
+	];
+	return { header, projects };
+}
+
+type FlatItem = { kind: "p"; p: ProjAgg } | { kind: "m"; p: ProjAgg; m: ModelAgg };
+
+class CostBrowser {
+	private sel = 0;
+	private expanded = new Set<string>();
+	private flat: FlatItem[] = [];
+	private readonly nameW = 30;
+
+	constructor(
+		private tui: TUI,
+		private theme: Theme,
+		private header: string[],
+		private projects: ProjAgg[],
+		private done: () => void,
+	) {
+		this.rebuild();
+	}
+
+	private rebuild(): void {
+		this.flat = [];
+		for (const p of this.projects) {
+			this.flat.push({ kind: "p", p });
+			if (this.expanded.has(p.key)) for (const m of p.models) this.flat.push({ kind: "m", p, m });
+		}
+		if (this.sel >= this.flat.length) this.sel = Math.max(0, this.flat.length - 1);
+	}
+
+	invalidate(): void {}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data === "q") {
+			this.done();
+			return;
+		}
+		if (this.flat.length === 0) return;
+		if (matchesKey(data, "up")) {
+			this.sel = this.sel === 0 ? this.flat.length - 1 : this.sel - 1;
+		} else if (matchesKey(data, "down")) {
+			this.sel = this.sel === this.flat.length - 1 ? 0 : this.sel + 1;
+		} else if (matchesKey(data, "return") || matchesKey(data, "space") || matchesKey(data, "right") || matchesKey(data, "left")) {
+			const key = this.flat[this.sel].p.key; // expand/collapse the selected project (or the parent of a model row)
+			if (this.expanded.has(key)) this.expanded.delete(key);
+			else this.expanded.add(key);
+			this.rebuild();
+		} else return;
+		this.tui.requestRender();
+	}
+
+	private projRow(p: ProjAgg, open: boolean): string {
+		const caret = p.models.length > 1 ? (open ? "▾ " : "▸ ") : "  ";
+		const name = p.name.length > this.nameW - 2 ? p.name.slice(0, this.nameW - 3) + "…" : p.name.padEnd(this.nameW - 2);
+		const last = new Date(p.last).toISOString().slice(0, 10);
+		return (
+			caret + name + " " + money(p.cost).padStart(9) + "  " + money(p.month).padStart(9) + "  " +
+			ktok(p.tokens).padStart(9) + "  " + String(p.msgs).padStart(5) + "  " + last
+		);
+	}
+
+	private modelRow(m: ModelAgg, width: number): string {
+		const nm = `${m.provider ? m.provider + "/" : ""}${m.name}`;
+		// numbers take ~34 cols; give the rest to the name, and keep the TAIL (model version) on overflow.
+		const avail = Math.max(12, width - 40);
+		const label = nm.length > avail ? "…" + nm.slice(nm.length - (avail - 1)) : nm.padEnd(avail);
+		return "    ↳ " + label + " " + money(m.cost).padStart(9) + "  " + ktok(m.tokens).padStart(9) + "  " + String(m.msgs).padStart(5);
+	}
+
+	render(width: number): string[] {
+		const th = this.theme;
+		const out: string[] = [];
+		for (const h of this.header) out.push(h);
+		out.push("");
+		if (this.flat.length === 0) {
+			out.push("  No cost data logged yet.");
+			return out.map((l) => truncateToWidth(l, width));
+		}
+		out.push(`  ${"PROJECT".padEnd(this.nameW)}SPEND        MONTH       TOKENS     MSGS   LAST`);
+		out.push("  " + "-".repeat(Math.min(78, Math.max(20, width - 4))));
+
+		const chrome = out.length + 2; // header block + footer lines
+		const rows = (this.tui.terminal?.rows ?? 40);
+		const maxRows = Math.max(4, Math.floor(rows * 0.85) - chrome);
+		const startIdx = Math.max(0, Math.min(this.sel - Math.floor(maxRows / 2), this.flat.length - maxRows));
+		const endIdx = Math.min(startIdx + maxRows, this.flat.length);
+
+		for (let i = startIdx; i < endIdx; i++) {
+			const it = this.flat[i];
+			const body = it.kind === "p" ? this.projRow(it.p, this.expanded.has(it.p.key)) : this.modelRow(it.m, width);
+			const selected = i === this.sel;
+			const line = (selected ? "→ " : "  ") + body;
+			out.push(selected ? th.fg("accent", line) : it.kind === "m" ? th.fg("muted", line) : line);
+		}
+		if (startIdx > 0 || endIdx < this.flat.length) out.push(th.fg("dim", `  (${this.sel + 1}/${this.flat.length})`));
+		out.push("");
+		out.push(th.fg("dim", "  ↑/↓ move · enter/→ expand model breakdown · esc/q close"));
+		return out.map((l) => truncateToWidth(l, width));
+	}
+}
+
 // Scan pi session files and replay their per-message usage into the log,
 // deduped by content fingerprint so re-runs, live-logged rows, and forked
 // sessions never double-count. Returns a report.
@@ -314,17 +480,37 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("costs", {
-		description: "AI spend per project/model (args: [models] [today|week|month|all] | backfill)",
+		description: "AI spend per project/model (args: [models] [today|week|month|all] | backfill) — project view is scrollable, enter expands per-model",
 		handler: async (args, ctx) => {
 			const toks = (args || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
-			const lines = toks.includes("backfill")
-				? runBackfill()
-				: buildReport(
-						readRows(),
-						toks.find((t) => ["today", "week", "month", "all"].includes(t)) || "all",
-						toks.includes("models") || toks.includes("model"),
-				  );
+			const win = toks.find((t) => ["today", "week", "month", "all"].includes(t)) || "all";
+			const byModel = toks.includes("models") || toks.includes("model");
 
+			if (toks.includes("backfill")) {
+				const lines = runBackfill();
+				if (ctx.mode !== "tui") return void console.log(lines.join("\n"));
+				await ctx.ui.custom<null>(
+					(_tui, _theme, _kb, done) => ({
+						render: (width: number) => lines.map((l) => truncateToWidth(l, width)),
+						handleInput: () => done(null),
+						invalidate: () => {},
+					}),
+					{ overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } },
+				);
+				return;
+			}
+
+			// Interactive project browser (scroll + expand per-model) for the default by-project view.
+			if (!byModel && ctx.mode === "tui") {
+				const { header, projects } = buildProjectTree(readRows(), win);
+				await ctx.ui.custom<null>(
+					(tui, theme, _kb, done) => new CostBrowser(tui, theme, header, projects, () => done(null)),
+					{ overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } },
+				);
+				return;
+			}
+
+			const lines = buildReport(readRows(), win, byModel);
 			if (ctx.mode !== "tui") {
 				console.log(lines.join("\n"));
 				return;
