@@ -6,7 +6,20 @@ import { Type } from "@sinclair/typebox";
  * All memories stored in ~/.pi/agent/pi-memory/*.md
  */
 
-const MEMORY_PATH = `${process.env.HOME}/.pi/agent/pi-memory`;
+function getMemoryPath(): string {
+  const defaultPath = `${process.env.HOME}/.pi/agent/pi-memory`;
+  try {
+    const fs = require("fs");
+    const settingsPath = `${process.env.HOME}/.pi/agent/settings.json`;
+    if (fs.existsSync(settingsPath)) {
+      const p = JSON.parse(fs.readFileSync(settingsPath, "utf-8"))?.vaultMemory?.memoryPath;
+      if (p) return p.startsWith("~/") ? `${process.env.HOME}${p.slice(1)}` : p;
+    }
+  } catch {}
+  return defaultPath;
+}
+
+const MEMORY_PATH = getMemoryPath();
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
