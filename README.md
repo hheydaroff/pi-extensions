@@ -29,6 +29,7 @@ After deploying, run `/reload` inside pi (or restart) to pick up changes.
 | **`exit-alias.ts`** | Adds `/exit` as an alias for the built-in `/quit`. |
 | **`coffee-break.ts`** | Prevents the machine from sleeping while the agent is working (macOS `caffeinate`, Linux `systemd-inhibit`, Windows `SetThreadExecutionState`). Auto-releases when the turn ends. |
 | **`radio-garden.ts`** | `/radio` — listen to live radio from [radio.garden](https://radio.garden). Random station, search by name, or browse by city/country. Shows the current station in a sticky footer widget. Requires `mpv` or `ffplay`. |
+| **`image-eyes.ts`** | Gives text-only models eyes. When the active model can't see images, pasted image paths / attachments are converted to precise text instead of being dropped: a vision LLM (pinned to EU Claude Haiku 4.5, override via `IMAGE_EYES_MODEL="provider/id"`) describes layout/position/colors/sizes query-aware, and local Apple-Vision OCR appends exact text. Adds `/look <path>` and a `look` tool for follow-up details. Invisible on vision-capable models. |
 | **`pocket-tts.ts`** | `/voice` — text-to-speech voice output of assistant replies using a configurable TTS model. |
 
 ### Memory & Sessions
