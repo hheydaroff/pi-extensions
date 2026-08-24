@@ -7,16 +7,15 @@
  *   /add-agent-md            — list available templates
  *   /add-agent-md code       — copy agent-md-templates/code.md → ./AGENTS.md
  *
- * Templates live in agent-md-templates/ next to this file and travel with it
- * (deploy.sh mirrors the whole repo). Add more by dropping <name>.md there.
+ * Templates live in ~/.pi/agent/agent-md/. Add more by dropping <name>.md there.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
 
-const TEMPLATES_DIR = join(dirname(fileURLToPath(import.meta.url)), "agent-md-templates");
+const TEMPLATES_DIR = join(homedir(), ".pi", "agent", "agent-md");
 
 function listTemplates(): string[] {
   return readdirSync(TEMPLATES_DIR)
