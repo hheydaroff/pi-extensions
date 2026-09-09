@@ -349,8 +349,23 @@ export default function (pi: ExtensionAPI) {
 		const textOnly = !ctx.model?.input.includes("image");
 		if (!textOnly) return { action: "continue" as const };
 
-		const attached = (event.images as ImageBlock[] | undefined) ?? [];
+		// Messages the agent injects itself (image-eyes's own descriptions via
+		// sendUserMessage, or other extensions) must not be re-described back into text.
+		if ((event as any).source === "extension") return { action: "continue" as const };
+
 		const paths = extractImagePaths(event.text);
+
+		// Image generation/editing is handled by dashscope-image, which needs the
+		// raw file path (not a description). Only skip when a real path exists AND
+		// the verb is an unambiguous edit/generate action, so benign prompts like
+		// "create a summary of photo.jpg" are still described.
+		const editVerb = /\b(generate|edit|modify|transform|restyle|stylize|recolou?r|remove|replace|upscale|enhance|render|paint|inpaint|outpaint|combine|merge|blend|overlay|composite)\b/i;
+		const imageNoun = /(image|picture|photo|logo|icon|illustration|drawing|wallpaper|poster|thumbnail|avatar|screenshot|render)/i;
+		if (paths.length > 0 && editVerb.test(event.text) && imageNoun.test(event.text)) {
+			return { action: "continue" as const };
+		}
+
+		const attached = (event.images as ImageBlock[] | undefined) ?? [];
 
 		if (attached.length === 0 && paths.length === 0) return { action: "continue" as const };
 

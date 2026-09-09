@@ -1,0 +1,5 @@
+# Mined security-log corpus and replay results contain real payloads: personal
+# folder names, work API hosts, and API keys/credentials pulled from historical
+# session logs. Never commit these; regenerate with mine.py / replay.py.
+labelled_corpus.json
+replay_results.json

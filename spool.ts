@@ -46,6 +46,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -95,7 +96,11 @@ function loadInterceptPref(): boolean | null {
 function saveInterceptPref(v: boolean | null): void {
   try {
     mkdirSync(ROOT, { recursive: true });
-    writeFileSync(STATE_PATH, JSON.stringify({ intercept: v }));
+    // Atomic swap — other sessions read this file, and a torn read parses as no
+    // preference at all.
+    const tmp = `${STATE_PATH}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ intercept: v }));
+    renameSync(tmp, STATE_PATH);
   } catch {}
 }
 

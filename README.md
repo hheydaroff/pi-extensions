@@ -30,6 +30,7 @@ After deploying, run `/reload` inside pi (or restart) to pick up changes.
 | **`coffee-break.ts`** | Prevents the machine from sleeping while the agent is working (macOS `caffeinate`, Linux `systemd-inhibit`, Windows `SetThreadExecutionState`). Auto-releases when the turn ends. |
 | **`radio-garden.ts`** | `/radio` — listen to live radio from [radio.garden](https://radio.garden). Random station, search by name, or browse by city/country. Shows the current station in a sticky footer widget. Requires `mpv` or `ffplay`. |
 | **`image-eyes.ts`** | Gives text-only models eyes. When the active model can't see images, pasted image paths / attachments are converted to precise text instead of being dropped: a vision LLM (pinned to EU Claude Haiku 4.5, override via `IMAGE_EYES_MODEL="provider/id"`) describes layout/position/colors/sizes query-aware, and local Apple-Vision OCR appends exact text. Adds `/look <path>` and a `look` tool for follow-up details. Invisible on vision-capable models. |
+| **`dashscope-image.ts`** | `generate_image` tool + `/image` command for DashScope image generation: qwen-image-3.0 / qwen-image-3.0-pro (text-to-image + image-to-image, sync) and wan2.6-image (image editing / subject-consistency, async). Saves PNGs to the CWD. Auth + endpoint are auto-derived from the `dashscope` provider in `models.json` (override via `dashscope-image` in settings.json). |
 | **`pocket-tts.ts`** | `/voice` — text-to-speech voice output of assistant replies using a configurable TTS model. |
 
 ### Memory & Sessions

@@ -3,7 +3,7 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -282,7 +282,11 @@ export default function (pi: ExtensionAPI) {
         // non-fatal
       }
       const { added, removed } = applyPlans(file, plans);
-      writeFileSync(MODELS_PATH, JSON.stringify(file, null, 2) + "\n", "utf8");
+      // Atomic swap: pi reads models.json too, and a half-written file yields no
+      // models rather than the old ones.
+      const tmpPath = `${MODELS_PATH}.${process.pid}.tmp`;
+      writeFileSync(tmpPath, JSON.stringify(file, null, 2) + "\n", "utf8");
+      renameSync(tmpPath, MODELS_PATH);
       ctx.modelRegistry.refresh();
 
       const summary: string[] = [];

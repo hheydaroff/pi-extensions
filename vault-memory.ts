@@ -35,7 +35,62 @@ function writeFileSync(path: string, content: string) {
   const fs = require("fs");
   const dir = require("path").dirname(path);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path, content, "utf-8");
+  // Write-then-rename: rename is atomic within a directory, so another pi session
+  // reading this memory sees either the old file or the new one, never half of one.
+  // The pid keeps two sessions from sharing a tmp name.
+  const tmp = `${path}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, content, "utf-8");
+  fs.renameSync(tmp, path);
+}
+
+/**
+ * Mutual exclusion for a read-modify-write, across every open pi session.
+ *
+ * Appending to a memory means read + rewrite the whole file. Two sessions doing it
+ * at once both start from the same base, so the second write silently erases the
+ * first append. O_EXCL create is atomic between processes; a lock left behind by a
+ * crashed session is stolen after LOCK_STALE_MS.
+ */
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 3_000;
+
+function withLock<T>(targetPath: string, fn: () => T): T {
+  const fs = require("fs");
+  const lockPath = `${targetPath}.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let held = false;
+
+  while (!held) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      held = true;
+    } catch {
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue; // lock vanished between create and stat — retry
+      }
+      // Fail loudly rather than write unlocked: an unlocked write is the silent
+      // lost append this exists to prevent.
+      if (Date.now() > deadline) {
+        throw new Error(`could not acquire ${lockPath} within ${LOCK_WAIT_MS}ms`);
+      }
+      // ponytail: synchronous spin. Contention is milliseconds and the caller is
+      // already blocking on file IO; a timer/async lock would need a promise chain
+      // through every call site for no measurable gain.
+      const spinUntil = Date.now() + 40;
+      while (Date.now() < spinUntil) { /* wait */ }
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    try { fs.unlinkSync(lockPath); } catch {}
+  }
 }
 
 function listMemoryFiles(): { name: string; description: string; path: string }[] {
@@ -188,14 +243,22 @@ ${memoryIndex}
           const slug = slugify(name);
           if (!slug) return { content: [{ type: "text", text: "Error: name produced an empty slug. Use alphanumeric characters." }], details: {}, isError: true };
           const filePath = `${MEMORY_PATH}/${slug}.md`;
-          const existing = readFileSync(filePath);
-          if (!existing) {
+          const now = new Date().toISOString().split("T")[0];
+          let updated: string | null;
+          try {
+            updated = withLock(filePath, () => {
+              const existing = readFileSync(filePath);
+              if (!existing) return null;
+              const next = existing.replace(/updated:\s*\S+/, `updated: ${now}`);
+              writeFileSync(filePath, next.trimEnd() + `\n\n${content}\n`);
+              return next;
+            });
+          } catch (err) {
+            return { content: [{ type: "text", text: `Error: another session is holding '${slug}' — ${err instanceof Error ? err.message : String(err)}. Nothing was written; retry.` }], details: {}, isError: true };
+          }
+          if (updated === null) {
             return { content: [{ type: "text", text: `Memory '${slug}' not found. Use action 'write' to create it first.` }], details: {}, isError: true };
           }
-          const now = new Date().toISOString().split("T")[0];
-          let updated = existing.replace(/updated:\s*\S+/, `updated: ${now}`);
-          updated = updated.trimEnd() + `\n\n${content}\n`;
-          writeFileSync(filePath, updated);
           return { content: [{ type: "text", text: `✅ Memory '${slug}' updated.` }], details: { name: slug, path: filePath, action: "updated" } };
         }
 

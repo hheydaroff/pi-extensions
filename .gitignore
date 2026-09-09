@@ -5,3 +5,10 @@ pi-session-*.html
 *.json.bak
 signal-bridge.json
 .signal-cli/
+.pi-subagents/
+tests/security-boundary/sec-ext.cjs
+tests/security-boundary/node_modules/
+tests/vault-memory-lock/vm-ext.cjs
+tests/vault-memory-lock/scratch-home/
+# Private internal design doc — local only, never commit.
+AI-REVIEW-WORKFLOW.md

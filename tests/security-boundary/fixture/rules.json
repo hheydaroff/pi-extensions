@@ -1,0 +1,35 @@
+{
+  "bash": {
+    "prohibit": [
+      { "pattern": "\\.env\\b", "description": "credential files (.env)", "guidance": "Never read or write .env credential files." }
+    ],
+    "ask": [
+      { "pattern": "\\b(?:chmod|chown)\\b", "description": "permission change (chmod/chown)", "aiReview": true },
+      { "pattern": "\\bcurl\\b", "description": "outbound curl request", "aiReview": true,
+        "allowedPatterns": [
+          "^(?![\\s\\S]*(-d\\b|--data|-F\\b|--form|-T\\b|--upload-file|-X\\s*(POST|PUT|PATCH)|-u\\b|--user|-H\\s*[\"']?Authorization))[\\s\\S]*\\b(raw\\.githubusercontent\\.com|api\\.github\\.com)"
+        ] },
+      { "pattern": "\\brm\\b", "description": "recursive/deletion (rm)", "aiReview": false },
+      { "pattern": "\\bsudo\\b", "description": "privilege escalation (sudo)", "aiReview": true },
+      { "pattern": "security\\.json", "description": "security rules file (human-only)", "aiReview": false }
+    ]
+  },
+  "paths": {
+    "zeroAccess": [],
+    "readOnly": [],
+    "noDelete": [],
+    "askOnWrite": []
+  },
+  "boundary": {
+    "enabled": true,
+    "mode": "ask",
+    "aiReview": true,
+    "allowedPaths": [
+      "~/development/",
+      "~/.pi/",
+      "/tmp/",
+      "~/Downloads/pub/",
+      "~/Documents/scratch-data/"
+    ]
+  }
+}

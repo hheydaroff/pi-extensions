@@ -8,6 +8,15 @@ import { Type } from "@sinclair/typebox";
  * When a job triggers, it sends a prompt to pi as a Signal message
  * so the response goes back to your phone.
  *
+ * Every open pi session runs a ticker against that one shared file, so two
+ * things keep a job from misfiring:
+ *   1. cron-home  — the one session jobs are supposed to run in (/cron home).
+ *                   Other sessions stay out of it unless cron-home is closed,
+ *                   in which case one of them runs the job as a fallback so it
+ *                   is never silently skipped.
+ *   2. claim file — O_EXCL in ~/.pi/agent/cron-claims/ so that even if several
+ *                   sessions are eligible, only one actually fires.
+ *
  * Cron format: "minute hour day month weekday" (standard 5-field)
  *   - Use * for any, star/N for every N, comma-separated values
  *   - Examples: "0 9 * * *" = every day at 9am
@@ -17,6 +26,18 @@ import { Type } from "@sinclair/typebox";
  */
 
 const JOBS_FILE = `${process.env.HOME}/.pi/agent/cron-jobs.json`;
+// Every open pi session runs its own ticker against the same jobs file. This dir
+// is the cross-process mutex: the first session to create a claim file (O_EXCL)
+// fires the job, the rest skip. So a job runs exactly once no matter how many
+// sessions are open — and still runs when only one is.
+const CLAIM_DIR = `${process.env.HOME}/.pi/agent/cron-claims`;
+const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
+// Which session jobs should run in, by cwd. Separate file so old sessions that
+// are still running keep parsing cron-jobs.json as a plain array.
+const HOME_FILE = `${process.env.HOME}/.pi/agent/cron-home.json`;
+// How long a non-home session waits before running an unclaimed job itself.
+// Must exceed the 30s tick interval plus slack for a stalled event loop.
+const FALLBACK_DELAY_MS = 120_000;
 
 interface CronJob {
   id: string;
@@ -99,12 +120,74 @@ function generateId(): string {
   return Math.random().toString(36).slice(2, 8);
 }
 
+/**
+ * Claim the right to fire a job. Atomic across processes via O_EXCL create.
+ * @param key minute bucket for cron jobs, "once" for one-shot jobs (fire once ever).
+ */
+function claimFire(jobId: string, key: string): boolean {
+  const fs = require("fs");
+  try {
+    fs.mkdirSync(CLAIM_DIR, { recursive: true });
+    fs.writeFileSync(`${CLAIM_DIR}/${jobId}-${key}`, String(process.pid), { flag: "wx" });
+  } catch {
+    return false; // another session won this one
+  }
+  // Prune expired claims. Only runs on a successful claim, so it's rare.
+  try {
+    const cutoff = Date.now() - CLAIM_TTL_MS;
+    for (const name of fs.readdirSync(CLAIM_DIR)) {
+      const p = `${CLAIM_DIR}/${name}`;
+      if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+    }
+  } catch {}
+  return true;
+}
+
+function isClaimed(jobId: string, key: string): boolean {
+  const fs = require("fs");
+  return fs.existsSync(`${CLAIM_DIR}/${jobId}-${key}`);
+}
+
+// ─── Cron home (which session jobs run in) ──────────────────────────────────
+
+function normalizePath(p: string): string {
+  const fs = require("fs");
+  try { return fs.realpathSync(p); } catch { return p; }
+}
+
+/** Pinned cwd, or null when unpinned (then any session may run jobs). */
+function loadHome(): string | null {
+  try {
+    const fs = require("fs");
+    if (!fs.existsSync(HOME_FILE)) return null;
+    const cwd = JSON.parse(fs.readFileSync(HOME_FILE, "utf-8")).cwd;
+    return typeof cwd === "string" && cwd ? normalizePath(cwd) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveHome(cwd: string | null) {
+  const fs = require("fs");
+  if (cwd === null) {
+    try { fs.unlinkSync(HOME_FILE); } catch {}
+    return;
+  }
+  fs.writeFileSync(HOME_FILE, JSON.stringify({ cwd }, null, 2), "utf-8");
+}
+
+function isHomeSession(): boolean {
+  const home = loadHome();
+  return home === null || home === normalizePath(process.cwd());
+}
+
 // ─── Extension ──────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   let jobs: CronJob[] = loadJobs();
   let tickTimer: any = null;
   let lastTickMinute = -1;
+  let fallbackTimers: any[] = [];
 
   // Find Signal recipient from config
   function getSignalRecipient(): string | null {
@@ -131,32 +214,26 @@ export default function (pi: ExtensionAPI) {
       if (currentMinute === lastTickMinute) return; // only fire once per minute
       lastTickMinute = currentMinute;
 
-      const toRemove: string[] = [];
+      // Re-read every tick: jobs are shared across all open pi sessions, and a
+      // stale in-memory copy both re-fires removed jobs and clobbers jobs added
+      // in another session when we save.
+      jobs = loadJobs();
+
+      const minuteKey = String(Math.floor(now.getTime() / 60_000));
+      const eligible = isHomeSession();
 
       for (const job of jobs) {
         if (!job.enabled) continue;
 
-        // "once" jobs — check if it's time
-        if (job.schedule === "once" && job.runOnceAt) {
-          const target = new Date(job.runOnceAt);
-          if (now >= target) {
-            fireJob(job);
-            toRemove.push(job.id);
-          }
-          continue;
-        }
+        const isOnce = job.schedule === "once";
+        const due = isOnce
+          ? !!job.runOnceAt && now >= new Date(job.runOnceAt)
+          : cronMatches(job.schedule, now);
+        if (!due) continue;
 
-        // Cron jobs
-        if (cronMatches(job.schedule, now)) {
-          fireJob(job);
-          job.lastRun = now.toISOString();
-        }
-      }
-
-      // Remove one-shot jobs that fired
-      if (toRemove.length > 0) {
-        jobs = jobs.filter(j => !toRemove.includes(j.id));
-        saveJobs(jobs);
+        const key = isOnce ? "once" : minuteKey;
+        if (eligible) runJob(job.id, key, false);
+        else armFallback(job.id, key);
       }
     }, 30_000);
 
@@ -168,20 +245,64 @@ export default function (pi: ExtensionAPI) {
       clearInterval(tickTimer);
       tickTimer = null;
     }
+    for (const t of fallbackTimers) clearTimeout(t);
+    fallbackTimers = [];
   }
 
-  function fireJob(job: CronJob) {
+  /**
+   * Claim, fire, and persist one job. Re-reads from disk first so a job that was
+   * removed or paused between arming and firing does not run, and so saving here
+   * never clobbers a job another session just added.
+   */
+  function runJob(jobId: string, key: string, fallback: boolean): boolean {
+    const job = loadJobs().find(j => j.id === jobId);
+    if (!job || !job.enabled) return false;
+    if (!claimFire(job.id, key)) return false; // another session got there first
+
+    fireJob(job, fallback);
+
+    const fresh = loadJobs();
+    if (job.schedule === "once") {
+      saveJobs(fresh.filter(j => j.id !== job.id));
+    } else {
+      const target = fresh.find(j => j.id === job.id);
+      if (target) {
+        target.lastRun = new Date().toISOString();
+        saveJobs(fresh);
+      }
+    }
+    jobs = fresh;
+    return true;
+  }
+
+  /**
+   * We are not the cron home, so stay out of it — unless nobody claims the job,
+   * which means the home session is closed. Then run it anyway rather than let
+   * the job silently not happen.
+   */
+  function armFallback(jobId: string, key: string) {
+    const timer = setTimeout(() => {
+      fallbackTimers = fallbackTimers.filter(t => t !== timer);
+      if (!isClaimed(jobId, key)) runJob(jobId, key, true);
+    }, FALLBACK_DELAY_MS);
+    if (timer.unref) timer.unref();
+    fallbackTimers.push(timer);
+  }
+
+  function fireJob(job: CronJob, fallback = false) {
     const recipient = job.signalRecipient || getSignalRecipient();
+    // Say so when the pinned session was not the one that ran it.
+    const tag = fallback ? ` [fallback: cron home not open, ran in ${process.cwd()}]` : "";
     if (recipient) {
       // Route through Signal so response goes to phone
       pi.sendUserMessage(
-        `[Signal message from ${recipient}]: [Scheduled: ${job.name}] ${job.prompt}`,
+        `[Signal message from ${recipient}]: [Scheduled: ${job.name}]${tag} ${job.prompt}`,
         { deliverAs: "followUp" }
       );
     } else {
       // No Signal — just run as a regular prompt
       pi.sendUserMessage(
-        `[Scheduled: ${job.name}] ${job.prompt}`,
+        `[Scheduled: ${job.name}]${tag} ${job.prompt}`,
         { deliverAs: "followUp" }
       );
     }
@@ -228,6 +349,10 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { action } = params;
 
+      // Another session may have added/removed jobs since our last tick; without
+      // this, saveJobs() below would write a stale list and delete them.
+      jobs = loadJobs();
+
       switch (action) {
         case "list": {
           if (jobs.length === 0) {
@@ -238,9 +363,13 @@ export default function (pi: ExtensionAPI) {
             const last = j.lastRun ? ` (last: ${j.lastRun.split("T")[0]})` : "";
             return `${status} **${j.name}** [${j.id}] — \`${j.schedule}\`${last}\n   → ${j.prompt}`;
           });
+          const home = loadHome();
+          const homeLine = home
+            ? `\n\n🏠 cron home: \`${home}\`${isHomeSession() ? " (this session)" : " (not this session)"}`
+            : "\n\n🏠 cron home: not set — jobs fire in any open session";
           return {
-            content: [{ type: "text", text: `## Scheduled Jobs (${jobs.length})\n\n${lines.join("\n\n")}` }],
-            details: { count: jobs.length, jobs: jobs.map(j => ({ id: j.id, name: j.name, enabled: j.enabled })) },
+            content: [{ type: "text", text: `## Scheduled Jobs (${jobs.length})${homeLine}\n\n${lines.join("\n\n")}` }],
+            details: { count: jobs.length, home, jobs: jobs.map(j => ({ id: j.id, name: j.name, enabled: j.enabled })) },
           };
         }
 
@@ -313,21 +442,47 @@ export default function (pi: ExtensionAPI) {
   // ── Command ─────────────────────────────────────────────────────────────
 
   pi.registerCommand("cron", {
-    description: "List, add, or remove scheduled jobs",
+    description: "List jobs, or pin them to this session with /cron home",
     handler: async (args, ctx) => {
       const sub = (args || "").trim();
+      if (sub === "home" || sub.startsWith("home ")) {
+        const arg = sub.slice(4).trim();
+        if (arg === "off") {
+          saveHome(null);
+          ctx.ui.notify("cron home cleared — jobs fire in whichever session claims them first.", "info");
+        } else {
+          const target = arg ? normalizePath(arg) : normalizePath(process.cwd());
+          saveHome(target);
+          ctx.ui.notify(
+            `🏠 cron home: ${target}\nJobs fire only in the pi session with this cwd.\n` +
+            `If that session is closed, another one runs the job as a fallback after 2 min.`,
+            "info",
+          );
+        }
+        return;
+      }
       if (!sub || sub === "list") {
+        jobs = loadJobs();
+        const home = loadHome();
+        const homeLine = home
+          ? `🏠 cron home: ${home}${isHomeSession() ? "  ← this session" : "  (not this session)"}`
+          : "🏠 cron home: not set — jobs fire in any open session";
         if (jobs.length === 0) {
-          ctx.ui.notify("No scheduled jobs.", "info");
+          ctx.ui.notify(`No scheduled jobs.\n${homeLine}`, "info");
         } else {
           const lines = jobs.map(j => {
             const s = j.enabled ? "✅" : "⏸️";
             return `${s} ${j.name} [${j.id}] — ${j.schedule}\n  → ${j.prompt}`;
           });
-          ctx.ui.notify(lines.join("\n"), "info");
+          ctx.ui.notify(`${homeLine}\n\n${lines.join("\n")}`, "info");
         }
       } else {
-        ctx.ui.notify("/cron — list jobs\nUse the cron_schedule tool to add/remove/toggle jobs.", "info");
+        ctx.ui.notify(
+          "/cron — list jobs\n/cron home — pin jobs to this session's cwd\n" +
+          "/cron home <path> — pin to a path\n/cron home off — unpin\n\n" +
+          "Use the cron_schedule tool to add/remove/toggle jobs.",
+          "info",
+        );
       }
     },
   });

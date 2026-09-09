@@ -51,6 +51,12 @@ import { join, resolve } from "node:path";
 
 const GLOBAL_SECRETS_DIR = join(homedir(), ".pi", ".secrets");
 
+const BLOCK_REASON =
+	"Direct access to .pi/.secrets/ is ABSOLUTELY PROHIBITED. Do NOT retry, and do NOT try any " +
+	"alternative command, path, or workaround to reach these files — if you do, the user will abort " +
+	"the entire operation. If a secret is truly required for your task, tell the user exactly what " +
+	"you need and they will provide it themselves. Otherwise continue with the rest of the task.";
+
 type Secret = { name: string; value: string; source: "global" | "project" };
 
 /** Returns the project-level secrets dir for the given cwd. */
@@ -153,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 					"Secret guard: blocked bash command accessing a .pi/.secrets/ directory",
 					"warning",
 				);
-				return { block: true, reason: "Direct access to .pi/.secrets/ is not allowed." };
+				return { block: true, reason: BLOCK_REASON };
 			}
 			return undefined;
 		}
@@ -169,7 +175,7 @@ export default function (pi: ExtensionAPI) {
 					`Secret guard: blocked ${event.toolName} on ${event.input.path}`,
 					"warning",
 				);
-				return { block: true, reason: "Direct access to .pi/.secrets/ is not allowed." };
+				return { block: true, reason: BLOCK_REASON };
 			}
 			return undefined;
 		}
@@ -185,7 +191,7 @@ export default function (pi: ExtensionAPI) {
 					`Secret guard: blocked ${event.toolName} on a .pi/.secrets/ directory`,
 					"warning",
 				);
-				return { block: true, reason: "Direct access to .pi/.secrets/ is not allowed." };
+				return { block: true, reason: BLOCK_REASON };
 			}
 		}
 
