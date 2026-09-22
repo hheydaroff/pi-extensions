@@ -4,9 +4,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
  * Session Summary — Auto-saves a conversation summary when a session ends.
  *
  * On session shutdown or switch, extracts conversation highlights, tools used,
- * and files modified, then saves to the vault memory path as a session summary.
+ * and files modified, then saves to <memoryPath>/sessions/ as a session summary.
  *
  * Uses the same memoryPath config as vault-memory (from settings.json vaultMemory).
+ * Sessions go in a subdirectory on purpose: vault-memory indexes only *.md at the
+ * top level of memoryPath and injects that index into every system prompt, so a
+ * log-per-session must not sit beside the curated memories.
  */
 
 function expandPath(p: string): string {
@@ -114,7 +117,7 @@ export default function (pi: ExtensionAPI) {
       ].filter(Boolean).join("\n");
 
       const slug = `session-${dateStr}-${timeStr.replace(":", "")}`;
-      const filePath = `${memoryPath}/${slug}.md`;
+      const filePath = `${memoryPath}/sessions/${slug}.md`;
 
       const fs = require("fs");
       const path = require("path");
