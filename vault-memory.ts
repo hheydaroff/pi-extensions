@@ -122,6 +122,13 @@ function listMemoryFiles(): { name: string; description: string; path: string }[
   });
 }
 
+function archiveNote(): string {
+  try {
+    const n = require("fs").readdirSync(`${MEMORY_PATH}/archive`).filter((f: string) => f.endsWith(".md")).length;
+    return n ? `(+${n} archived memories not listed above; vault_memory read <name> still opens them, and the archive/ folder can be grepped.)` : "";
+  } catch { return ""; }
+}
+
 function buildMemoryIndex(): string {
   const files = listMemoryFiles();
   if (files.length === 0) return "(no memories stored yet)";
@@ -151,6 +158,7 @@ export default function (pi: ExtensionAPI) {
 ### Agent Memories (pi-memory/)
 The following memory files are available. Use the vault_memory tool with action "read" to load relevant ones when needed.
 ${memoryIndex}
+${archiveNote()}
 
 ### Memory Guidelines
 - When you learn something worth remembering (user preferences, project patterns, environment details, solutions to problems), use the vault_memory tool with action "write" to store it.
@@ -207,8 +215,12 @@ ${memoryIndex}
           if (!name) return { content: [{ type: "text", text: "Error: 'name' is required for read." }], details: {}, isError: true };
           const slug = slugify(name);
           if (!slug) return { content: [{ type: "text", text: "Error: name produced an empty slug. Use alphanumeric characters." }], details: {}, isError: true };
-          const filePath = `${MEMORY_PATH}/${slug}.md`;
-          const fileContent = readFileSync(filePath);
+          let filePath = `${MEMORY_PATH}/${slug}.md`;
+          let fileContent = readFileSync(filePath);
+          if (!fileContent) { // dream-archived memories leave the index but stay readable
+            filePath = `${MEMORY_PATH}/archive/${slug}.md`;
+            fileContent = readFileSync(filePath);
+          }
           if (!fileContent) {
             return { content: [{ type: "text", text: `Memory '${slug}' not found. Use action 'list' to see available memories.` }], details: {} };
           }
