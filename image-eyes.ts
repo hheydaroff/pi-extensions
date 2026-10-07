@@ -13,7 +13,7 @@
  * For each image:
  *   - PRIMARY: a vision-capable LLM describes it (layout, position, colors,
  *     relative sizes, element states) using a strict prompt. Model pinned to
- *     Claude Haiku 4.5 (EU Bedrock), override with IMAGE_EYES_MODEL="provider/id".
+ *     Claude Haiku 5.5 (EU Bedrock), override with IMAGE_EYES_MODEL="provider/id".
  *   - COMPLEMENT: local OCR (Apple Vision framework) appends the exact text,
  *     so code/IDs/numbers are never hallucinated. Uses `mac-ocr` if installed,
  *     else a bundled Swift script.
@@ -102,8 +102,8 @@ type Model = NonNullable<ExtensionContext["model"]>;
 type ImageBlock = { type: "image"; data: string; mimeType: string };
 type ImageItem = { data: string; mimeType: string; ocrPath?: string; path?: string };
 
-/** Pinned default describer: Claude Haiku 4.5 (EU Bedrock). Override with IMAGE_EYES_MODEL="provider/model-id". */
-const DEFAULT_VISION = { provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-4-5-20251001-v1:0" };
+/** Pinned default describer: Claude Haiku 5.5 (EU Bedrock). Override with IMAGE_EYES_MODEL="provider/model-id". */
+const DEFAULT_VISION = { provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-5-5" };
 
 /** Recently seen images, keyed by short id, so the `look` tool can re-examine them. */
 const imageStore = new Map<string, { data: string; mimeType: string }>();

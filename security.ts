@@ -464,7 +464,7 @@ export default function (pi: ExtensionAPI) {
 	// untouched by this path, and the judge is fail-closed — any error, timeout
 	// or malformed answer means "ask the human", i.e. today's behaviour.
 	const JUDGE_PROVIDER = "amazon-bedrock";
-	const JUDGE_MODEL_ID = "eu.anthropic.claude-haiku-4-5-20251001-v1:0";
+	const JUDGE_MODEL_ID = "eu.anthropic.claude-haiku-5-5";
 	const JUDGE_TIMEOUT_MS = 10_000;
 	const JUDGE_CACHE_MAX = 500;
 

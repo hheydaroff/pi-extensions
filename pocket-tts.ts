@@ -19,7 +19,7 @@ interface PocketTTSConfig {
 const SETTINGS_KEY = "pocket-tts";
 
 const DEFAULTS: PocketTTSConfig = {
-  model: { provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-4-5-20251001-v1:0" },
+  model: { provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-5-5" },
   voice: "alba",
   language: "english",
   maxChars: 200,

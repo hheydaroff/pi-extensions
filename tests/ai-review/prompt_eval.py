@@ -17,7 +17,7 @@ import sys
 
 import boto3
 
-MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL = "eu.anthropic.claude-haiku-5-5"
 REGION = "eu-central-1"
 CWD = os.path.expanduser("~/development/pi-extensions")
 

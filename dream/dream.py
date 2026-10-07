@@ -38,12 +38,12 @@ MEM = mem_dir()
 
 
 def cfg_model():
-    """env DREAM_MODEL > $STATE/config.json {"model": "..."} > Haiku 4.5. Any `pi --list-models` id works."""
+    """env DREAM_MODEL > $STATE/config.json {"model": "..."} > Haiku 5.5. Any `pi --list-models` id works."""
     try:
         m = json.load(open(f"{STATE}/config.json")).get("model")
     except Exception:
         m = None
-    return os.environ.get("DREAM_MODEL") or m or "amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+    return os.environ.get("DREAM_MODEL") or m or "amazon-bedrock/eu.anthropic.claude-haiku-5-5"
 
 
 MODEL = cfg_model()

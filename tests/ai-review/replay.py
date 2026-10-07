@@ -29,7 +29,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 CORPUS = os.path.join(HERE, "labelled_corpus.json")
 SECURITY_TS = os.path.join(REPO, "security.ts")
 
-MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL = "eu.anthropic.claude-haiku-5-5"
 REGION = "eu-central-1"
 # Fallback only for entries whose session file carried no cwd; real sessions all have one.
 DEFAULT_CWD = REPO

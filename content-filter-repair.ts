@@ -12,7 +12,7 @@
  *     own question) or that can't be reworded → fallback turn (no placeholders).
  *   Output block (answer cut mid-stream): drop the partial answer → fallback turn.
  *
- *   Fallback turn: setModel(Sonnet 4.6, CONTENT_FILTER_FALLBACK=provider/id) and
+ *   Fallback turn: setModel(Sonnet 5.5, CONTENT_FILTER_FALLBACK=provider/id) and
  *   continue at once. When it settles, every message from that turn (plus
  *   unresolved hits) that the original model would reject is replaced, in
  *   context only, by a neutral Haiku summary (or a placeholder if even that is
@@ -35,8 +35,8 @@ const MAX_ROUNDS = 3; // reword rounds per prompt before falling back
 const MAX_PROBES = 60;
 const BATCH = 4;
 const MAX_REWRITE_CHARS = 24_000; // ponytail: longer texts count as unrewordable, chunk if that bites
-const REWRITER = ["CONTENT_FILTER_REWRITER", "amazon-bedrock", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"] as const;
-const FALLBACK = ["CONTENT_FILTER_FALLBACK", "amazon-bedrock", "eu.anthropic.claude-sonnet-4-6"] as const;
+const REWRITER = ["CONTENT_FILTER_REWRITER", "amazon-bedrock", "eu.anthropic.claude-haiku-5-5"] as const;
+const FALLBACK = ["CONTENT_FILTER_FALLBACK", "amazon-bedrock", "eu.anthropic.claude-sonnet-5-5"] as const;
 const PLACEHOLDER = "[exchange handled by a fallback model because of the provider's content filter; omitted]";
 
 const REWRITE_PROMPT = `Rewrite the text below so it passes a strict mainland-China content filter (Alibaba DashScope), while keeping every technical and factual detail the conversation still needs.

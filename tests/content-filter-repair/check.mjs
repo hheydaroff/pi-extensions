@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import ext from "../../content-filter-repair.ts";
 
 const qwen = { provider: "dashscope", id: "qwen" };
-const haiku = { provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-4-5-20251001-v1:0" };
-const sonnet = { provider: "amazon-bedrock", id: "eu.anthropic.claude-sonnet-4-6" };
+const haiku = { provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-5-5" };
+const sonnet = { provider: "amazon-bedrock", id: "eu.anthropic.claude-sonnet-5-5" };
 const ERR = '400 data: {"error":{"code":"data_inspection_failed","message":"Input text data may contain inappropriate content."}}';
 const OUT = "Output data may contain inappropriate content.";
 
@@ -64,7 +64,7 @@ r = await settle([
 ]);
 assert.deepEqual(r, { entries: [{ type: "context_edit", targetId: "a9", replacement: null }], continue: true });
 assert.deepEqual(setModelCalls, [sonnet.id]);
-assert.match(notes.at(-1), /↻ answer blocked mid-stream → eu\.anthropic\.claude-sonnet-4-6/);
+assert.match(notes.at(-1), /↻ answer blocked mid-stream → eu\.anthropic\.claude-sonnet-5-5/);
 //    Sonnet answers; at settle this run's flagged messages get neutral summaries (older harmless one untouched)
 end({ stopReason: "stop", content: [{ type: "text", text: "In June 1989…" }] });
 r = await settle([
