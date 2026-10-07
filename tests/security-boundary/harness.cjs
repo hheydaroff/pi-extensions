@@ -100,6 +100,12 @@ const cases = [
   { g: "FP", n: "two heredocs with same marker (reported bug)", cwd: REPO, tool: "bash", want: false,
     cmd: `cd ${REPO}/tests/security-boundary/node_modules && mkdir -p @earendil-works/pi-coding-agent @earendil-works/pi-ai && cat > @earendil-works/pi-coding-agent/index.js <<'STUB'\n// Faithful to the real implementation in core/extensions/types.js\nexports.isToolCallEventType = (toolName, event) => event.toolName === toolName;\nSTUB\ncat > @earendil-works/pi-ai/index.js <<'STUB'\nexports.StringEnum = (vals) => ({ type: \"string\", enum: vals });\nSTUB\nfind . -type f | sort` },
 
+  // Homelab 2026-10-05: writing a vault note with `cat > "Note.md" <<'EOF'` was denied as
+  // "outside working directory" — the un-stripped heredoc body (a youtube URL, `bbl/day`,
+  // `## 3. Refinery / diesel`) was mined for path tokens. Body must be dropped for `cat`.
+  { g: "FP", n: "vault note heredoc (homelab denial)", cwd: SCRATCH, tool: "bash", want: false,
+    cmd: `cd knowledge && cat > "Oil Apocalypse - Triple Oil Shock and Diesel Crisis.md" <<'EOF'\n---\ntype: note\nurl: "https://www.youtube.com/watch?v=OETnuwwsv9U"\nrelated:\n  - "[[UAE OPEC Exit - Game Theory and Energy Geopolitics]]"\n---\n\n## 3. Refinery / diesel crisis (the big one)\n- Region output falls from 20M to about 8M bbl/day.\n- Baseline transport about $3/bbl; 48 days vs 19.\nEOF\nls -la "Oil Apocalypse - Triple Oil Shock and Diesel Crisis.md"` },
+
   // ── Real violations: MUST still prompt ────────────────────────────────────
   { g: "ENF", n: "absolute path outside boundary", cwd: REPO, tool: "bash", want: true,
     cmd: "cat /etc/hosts" },
