@@ -56,6 +56,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import * as net from "node:net";
+import * as crypto from "node:crypto";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -121,6 +123,11 @@ interface CompiledConfig {
 	};
 }
 
+type ConfirmResult = "yes" | "no" | "expired" | "ai_allowed";
+type Via = "tui" | "matrix";
+/** What an approval prompt produced, and which side answered (absent for an AI approval). */
+interface Answer { res: ConfirmResult; via?: Via }
+
 interface AuditEntry {
 	tool: string;
 	input: string;
@@ -133,6 +140,8 @@ interface AuditEntry {
 	// model missing) shows up as these fields never appearing at all.
 	aiReason?: string;
 	aiConfidence?: string;
+	// Which side answered an approval prompt: the terminal dialog or the Matrix phone leg.
+	via?: Via;
 }
 
 // Protection strength ranking for hierarchy
@@ -173,6 +182,179 @@ function confirmPathBody(filePath: string, guidance?: string): string {
 		? `\n\nIf denied, the agent will be told:\n${guidance}`
 		: "";
 	return `Allow write to:\n${filePath}${guidanceSection}`;
+}
+
+// ── Remote approval leg (pi-matrix bridge) ───────────────────────────────────
+//
+// While a TUI prompt is open, the same request is also offered to the owner's phone
+// through the pi-matrix bridge's unix socket. The socket can CREATE requests only;
+// answers come back exclusively from Matrix events the bridge has verified (E2EE,
+// cross-signed device, pinned owner). Nothing here may ever treat bytes on the socket
+// as anything but an answer to the one request this connection opened.
+// Any failure (no socket, bridge down, protocol garbage) just means "no remote leg":
+// the TUI keeps working exactly as before.
+
+const remoteSock = () => process.env.PI_MATRIX_APPROVAL_SOCK || path.join(os.homedir(), ".config", "pi-matrix", "approvals.sock");
+const REMOTE_CONNECT_MS = 500;
+const REMOTE_DEFAULT_TIMEOUT_MS = 120_000; // 2 min, then deny
+
+/** The bridge socket if it exists and is a socket owned by us; null otherwise, or when this session is already relayed by the bridge. */
+function trustedBridgeSocket(): string | null {
+	// Sessions spawned by the bridge itself are relayed over RPC already; a second leg would double-prompt.
+	if (process.env.PI_MATRIX_ROOM) return null;
+	const sockPath = remoteSock();
+	try {
+		const st = fs.lstatSync(sockPath);
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		return st.isSocket() && (uid === undefined || st.uid === uid) ? sockPath : null;
+	} catch { return null; }
+}
+
+interface RemoteRequest {
+	cwd: string;
+	session: string;
+	title: string;
+	body: string;
+	rule: string;
+	aiNote?: string;
+	timeoutMs: number;
+}
+
+interface RemoteLeg {
+	/** Tell the bridge this prompt is over (answered locally, or expired) and hang up. */
+	cancel(reason: "answered_locally" | "expired"): void;
+}
+
+/**
+ * Connect and post the request. Resolves null (never rejects) when there is no usable
+ * bridge: sandboxed bridge-spawned session, no socket, wrong owner, connect > 500 ms.
+ * After a successful connect, exactly one of onDecision / onLost fires, at most once.
+ */
+function openRemoteApproval(
+	req: RemoteRequest,
+	h: { onDecision(d: "yes" | "no" | "expired"): void; onLost(): void },
+): Promise<RemoteLeg | null> {
+	return new Promise((resolve) => {
+		const sockPath = trustedBridgeSocket();
+		if (!sockPath) return resolve(null);
+
+		let connected = false;
+		let over = false;
+		const sock = net.createConnection(sockPath);
+		const giveUp = setTimeout(() => { if (!connected) { sock.destroy(); resolve(null); } }, REMOTE_CONNECT_MS);
+		const lost = () => { if (!over) { over = true; h.onLost(); } };
+		sock.on("error", () => { if (!connected) { clearTimeout(giveUp); resolve(null); } else { sock.destroy(); lost(); } });
+		sock.on("close", () => { if (!connected) { clearTimeout(giveUp); resolve(null); } else lost(); });
+		sock.once("connect", () => {
+			connected = true;
+			clearTimeout(giveUp);
+			sock.setEncoding("utf8");
+			let buf = "";
+			sock.on("data", (d: string) => {
+				buf += d;
+				if (buf.length > 65536) { sock.destroy(); return; } // a bridge never sends this much
+				let i: number;
+				while ((i = buf.indexOf("\n")) >= 0) {
+					const line = buf.slice(0, i); buf = buf.slice(i + 1);
+					let m: any; try { m = JSON.parse(line); } catch { continue; }
+					if (m?.type === "decision" && (m.decision === "yes" || m.decision === "no" || m.decision === "expired")) {
+						if (!over) { over = true; h.onDecision(m.decision); }
+						sock.destroy();
+					} else if (m?.type === "error") { sock.destroy(); }
+				}
+			});
+			try {
+				sock.write(JSON.stringify({ v: 1, id: crypto.randomUUID(), pid: process.pid, ...req }) + "\n");
+			} catch { sock.destroy(); }
+			resolve({
+				cancel(reason) {
+					over = true; // nothing more to report once we hang up ourselves
+					try { sock.write(JSON.stringify({ type: "cancel", reason }) + "\n"); } catch { /* gone already */ }
+					sock.end();
+					setTimeout(() => sock.destroy(), 1000).unref?.();
+				},
+			});
+		});
+	});
+}
+
+/**
+ * Run the TUI dialog and the phone leg side by side; first answer wins and the other side is
+ * cancelled. Resolves undefined when there is no phone leg, so the caller runs the plain TUI
+ * path. The phone leg can never make this reject; a TUI error propagates as it always did.
+ */
+async function raceWithRemote(
+	ctx: any,
+	title: string,
+	promptBody: string,
+	req: Omit<RemoteRequest, "timeoutMs">,
+	timeoutMs: number | undefined,
+): Promise<Answer | undefined> {
+	const remoteMs = Math.max(Number(process.env.PI_REMOTE_APPROVAL_TIMEOUT_MS) || REMOTE_DEFAULT_TIMEOUT_MS, timeoutMs ?? 0);
+	const tui = new AbortController();
+	let settled = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let leg: RemoteLeg | null = null;
+	let resolveAnswer!: (a: Answer) => void;
+	let rejectAnswer!: (e: unknown) => void;
+	const answered = new Promise<Answer>((res, rej) => { resolveAnswer = res; rejectAnswer = rej; });
+
+	// The single exit: only the first caller gets through; it stops the timer, closes the TUI dialog if asked, and tells the bridge why.
+	const close = (tellBridge: "answered_locally" | "expired" | null, abortTui: boolean): boolean => {
+		if (settled) return false;
+		settled = true;
+		if (timer) clearTimeout(timer);
+		if (abortTui) tui.abort();
+		if (tellBridge) leg?.cancel(tellBridge);
+		return true;
+	};
+	const finish = (res: ConfirmResult, via: Via) => {
+		const tellBridge = via === "tui" ? "answered_locally" : res === "expired" ? "expired" : null;
+		if (close(tellBridge, via === "matrix" || res === "expired")) resolveAnswer({ res, via });
+	};
+	const fail = (e: unknown) => { if (close("answered_locally", false)) rejectAnswer(e); };
+
+	// Lost bridge: fall back to the caller's own fuse, counted from now (the TUI dialog has no countdown any more).
+	const onLost = () => {
+		if (settled) return;
+		leg = null;
+		if (timer) clearTimeout(timer);
+		timer = timeoutMs ? setTimeout(() => finish("expired", "tui"), timeoutMs) : undefined;
+	};
+
+	leg = await openRemoteApproval(
+		{ ...req, timeoutMs: remoteMs },
+		{
+			// A remote "expired" is only an answer when the caller has a fuse at all; a no-fuse prompt waits for the TUI.
+			onDecision: (d) => { if (d === "expired") { if (timeoutMs !== undefined) finish("expired", "matrix"); else onLost(); } else finish(d, "matrix"); },
+			onLost,
+		},
+	);
+	if (!leg) return undefined;
+
+	// One timer for the whole race; the TUI dialog gets no {timeout} (a 30 s TUI fuse would deny while the phone is still being read).
+	if (timeoutMs !== undefined && !settled) timer = setTimeout(() => finish("expired", "matrix"), remoteMs);
+	Promise.resolve()
+		.then(() => (settled ? false : ctx.ui.confirm(title, promptBody, { signal: tui.signal })))
+		.then((ok: boolean) => finish(ok ? "yes" : "no", "tui"), fail);
+	return answered;
+}
+
+/** Fire-and-forget "🚫 blocked: <rule>" note for the phone. Text only, no way to answer; the bridge rate-limits it too. */
+let lastFyi = 0;
+function sendBlockedFyi(rule: string, cwd: string, session: string): void {
+	try {
+		const sockPath = trustedBridgeSocket();
+		if (!sockPath) return;
+		const now = Date.now();
+		if (now - lastFyi < 5000) return; // a blocked loop must not turn into a connection loop
+		lastFyi = now;
+		const sock = net.createConnection(sockPath);
+		const kill = setTimeout(() => sock.destroy(), REMOTE_CONNECT_MS);
+		(kill as any).unref?.();
+		sock.on("error", () => {});
+		sock.once("connect", () => { clearTimeout(kill); sock.end(JSON.stringify({ v: 1, type: "fyi", rule: rule.slice(0, 200), cwd: cwd.slice(0, 300), session: session.slice(0, 120) }) + "\n"); });
+	} catch { /* a note for the phone must never affect a block */ }
 }
 
 /** Compile a single regex pattern safely */
@@ -449,6 +631,9 @@ export default function (pi: ExtensionAPI) {
 
 	function log(entry: AuditEntry) {
 		pi.appendEntry("security-log", entry);
+		// Hard blocks never prompt, so the phone would otherwise never hear about them. Ask-type rules without a UI
+		// and the cwd boundary are left out: those are not "the rule said never".
+		if (entry.action === "blocked" && !/ask|boundary/i.test(entry.category)) sendBlockedFyi(entry.rule, process.cwd(), sessionLabel());
 	}
 
 	function emitBlocked(tool: string, input: string, rule: string, category: string) {
@@ -495,7 +680,6 @@ export default function (pi: ExtensionAPI) {
 
 	interface Verdict { verdict: "allow" | "block"; reason: string; confidence: string }
 
-	type ConfirmResult = "yes" | "no" | "expired" | "ai_allowed";
 	const APPROVED: ConfirmResult[] = ["yes", "ai_allowed"];
 
 	function judgePrompt(a: AiCtx): string {
@@ -594,61 +778,121 @@ Reply with ONLY compact JSON: {"verdict":"allow"|"block","reason":"<20 words max
 		}
 	}
 
+	const sessionLabel = (): string => {
+		try { const n = (pi as any).getSessionName?.(); if (n) return String(n); } catch { /* optional API */ }
+		return path.basename(process.cwd());
+	};
+
 	// Signal "pi is waiting on the user" to the shared event bus.
 	// herdr's pi integration reports state `blocked` ONLY when this fires
 	// (pi core emits no approval event), which drives herdr toasts/sidebar.
 	// The judge runs BEFORE emit(true), so a thinking model never toasts you.
-	async function confirmBlocked(
-		ctx: any,
-		label: string,
-		title: string,
-		body: string,
-		opts?: any,
-		aiCtx?: AiCtx,
-	): Promise<ConfirmResult> {
-		let promptBody = body;
-		if (aiCtx) {
-			const r = await judge(ctx, aiCtx);
+	/**
+	 * The approval channel: the AI judge first (it may settle the prompt or add a note), then the
+	 * terminal dialog and the phone side by side. Returns the answer and which side gave it.
+	 */
+	interface Prompt {
+		label: string; title: string; body: string;
+		timeoutMs?: number;        // the caller's fuse; PI_APPROVAL_TIMEOUT_MS can lengthen it, never shorten
+		terminalOnly?: boolean;    // never offered to the phone
+		ai?: AiCtx;                // present = the judge may approve without asking
+	}
+	async function confirmBlocked(ctx: any, p: Prompt): Promise<Answer> {
+		// PI_APPROVAL_TIMEOUT_MS lengthens (never shortens) approval fuses; set by pi-matrix so phone replies have time. TUI keeps the defaults.
+		const minTimeout = Number(process.env.PI_APPROVAL_TIMEOUT_MS) || 0;
+		const timeoutMs = p.timeoutMs !== undefined && minTimeout > 0 ? Math.max(p.timeoutMs, minTimeout) : p.timeoutMs;
+
+		let aiNote = ""; // shown above the command when the judge objected or was unavailable
+		if (p.ai) {
+			const ai = p.ai;
+			const logJudge = (action: AuditEntry["action"], aiReason: string, aiConfidence?: string) =>
+				log({ tool: ai.tool, input: ai.payload, rule: ai.rule, category: ai.category, action, aiReason, ...(aiConfidence ? { aiConfidence } : {}) });
+			const r = await judge(ctx, ai);
 			if (r.verdict === "allow") {
-				log({ tool: aiCtx.tool, input: aiCtx.payload, rule: aiCtx.rule, category: aiCtx.category, action: "approved_by_ai", aiReason: r.reason, aiConfidence: r.confidence });
-				try { ctx.ui.setStatus("security", `🤖 AI approved: ${aiCtx.rule}`); } catch { /* headless */ }
-				return "ai_allowed";
+				logJudge("approved_by_ai", r.reason, r.confidence);
+				try { ctx.ui.setStatus("security", `🤖 AI approved: ${ai.rule}`); } catch { /* headless */ }
+				return { res: "ai_allowed" };
 			}
 			if (r.verdict === "block") {
-				log({ tool: aiCtx.tool, input: aiCtx.payload, rule: aiCtx.rule, category: aiCtx.category, action: "escalated_to_user", aiReason: r.reason, aiConfidence: r.confidence });
-				promptBody = `🤖 AI review objected (${r.confidence} confidence): ${r.reason}\n\n${body}`;
+				logJudge("escalated_to_user", r.reason, r.confidence);
+				aiNote = `🤖 AI review objected (${r.confidence} confidence): ${r.reason}`;
 			} else if (r.unavailable) {
-				log({ tool: aiCtx.tool, input: aiCtx.payload, rule: aiCtx.rule, category: aiCtx.category, action: "judge_unavailable", aiReason: r.unavailable });
+				logJudge("judge_unavailable", r.unavailable);
 				try { ctx.ui.setStatus("security", `🤖 AI judge unavailable: ${r.unavailable}`); } catch { /* headless */ }
-				promptBody = `🤖 AI judge unavailable (${r.unavailable}) — asking you instead.\n\n${body}`;
+				aiNote = `🤖 AI judge unavailable (${r.unavailable}) — asking you instead.`;
 			}
 		}
+		const promptBody = aiNote ? `${aiNote}\n\n${p.body}` : p.body;
 
 		const emit = (active: boolean) => {
 			try {
-				(pi as any).events?.emit?.("herdr:blocked", { active, label });
+				(pi as any).events?.emit?.("herdr:blocked", { active, label: p.label });
 			} catch { /* events API may not exist */ }
 		};
 
-		const timeoutMs = typeof opts?.timeout === "number" ? opts.timeout : undefined;
-		const ctrl = new AbortController();
-		let timedOut = false;
-		const timer = timeoutMs ? setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs) : undefined;
 		const started = Date.now();
 		emit(true);
-		let ok = false;
 		try {
-			// Both mechanisms on purpose: {timeout} renders the live countdown, the
-			// AbortSignal is what lets us tell a fuse expiry from a deliberate "no".
-			ok = await ctx.ui.confirm(title, promptBody, timeoutMs ? { ...opts, signal: ctrl.signal } : opts);
+			// Phone leg: also offer this prompt to the owner's phone (pi-matrix bridge). First answer wins.
+			// Only reached after the judge decided to ask a human; undefined = no usable bridge.
+			const remote = p.terminalOnly ? undefined : await raceWithRemote(ctx, p.title, promptBody, {
+				cwd: ctx.cwd ?? "",
+				session: sessionLabel(),
+				title: p.title,
+				body: p.body.slice(0, 4000),
+				rule: p.label.replace(/^Approval needed:\s*/, ""),
+				aiNote: aiNote ? aiNote.slice(0, 600) : undefined,
+			}, timeoutMs);
+			if (remote) return remote;
+
+			// No phone leg: exactly the original TUI-only behaviour.
+			const ctrl = new AbortController();
+			let timedOut = false;
+			const timer = timeoutMs ? setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs) : undefined;
+			let ok = false;
+			try {
+				// Both mechanisms on purpose: {timeout} renders the live countdown, the
+				// AbortSignal is what lets us tell a fuse expiry from a deliberate "no".
+				ok = await ctx.ui.confirm(p.title, promptBody, timeoutMs ? { timeout: timeoutMs, signal: ctrl.signal } : undefined);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+			if (ok) return { res: "yes", via: "tui" };
+			// ponytail: 500ms slack — if pi's own countdown dismisses first our flag can still be unset; a human denying inside the final half-second is then misread as expiry, which is the safe direction (still a deny).
+			if (timedOut || ctrl.signal.aborted || (timeoutMs !== undefined && Date.now() - started >= timeoutMs - 500)) return { res: "expired", via: "tui" };
+			return { res: "no", via: "tui" };
 		} finally {
-			if (timer) clearTimeout(timer);
 			emit(false);
 		}
-		if (ok) return "yes";
-		// ponytail: 500ms slack — if pi's own countdown dismisses first our flag can still be unset; a human denying inside the final half-second is then misread as expiry, which is rare and only affects a log label
-		if (timedOut || ctrl.signal.aborted || (timeoutMs !== undefined && Date.now() - started >= timeoutMs - 500)) return "expired";
-		return "no";
+	}
+
+	/**
+	 * One human decision, end to end: prompt (judge, terminal, phone), then audit and grant.
+	 * A "no" or a timeout is logged here. A human "yes" runs `grant` and is logged here. An AI
+	 * approval grants nothing and was already logged by the judge (exact payload only).
+	 * The caller only decides what to return to pi.
+	 */
+	interface AskSpec {
+		tool: string; input: string; rule: string; category: string; // audit identity
+		label: string; title: string; body: string; timeoutMs: number;
+		ai?: AiCtx;
+		terminalOnly?: boolean;   // never offered to the phone (rule removal)
+		announceDenial?: boolean; // also show a status line and emit security:blocked on "no" / timeout
+		grant?: () => void;       // what a human "yes" allows for the rest of the session
+	}
+	async function askUser(ctx: any, a: AskSpec): Promise<{ allowed: boolean; res: ConfirmResult }> {
+		const { res, via } = await confirmBlocked(ctx, { label: a.label, title: a.title, body: a.body, timeoutMs: a.timeoutMs, terminalOnly: a.terminalOnly, ai: a.ai });
+		if (!APPROVED.includes(res)) {
+			if (a.announceDenial) ctx.ui.setStatus("security", `⚠️ ${res === "expired" ? "Timed out" : "Denied"}: ${a.rule}`);
+			log({ tool: a.tool, input: a.input, rule: a.rule, category: a.category, action: res === "expired" ? "expired" : "blocked_by_user", via });
+			if (a.announceDenial) emitBlocked(a.tool, a.input, a.rule, a.category);
+			return { allowed: false, res };
+		}
+		if (res === "yes") {
+			a.grant?.();
+			log({ tool: a.tool, input: a.input, rule: a.rule, category: a.category, action: "approved_by_user", via });
+		}
+		return { allowed: true, res };
 	}
 
 	// ── Find strongest matching path rule (protection hierarchy) ──────────────
@@ -722,29 +966,20 @@ Reply with ONLY compact JSON: {"verdict":"allow"|"block","reason":"<20 words max
 			return { block: true, reason: blockReason(reason) };
 		}
 
-		const res = await confirmBlocked(
-			ctx,
-			`Approval needed: outside-workspace access ${displayPath}`,
-			"⚠️ Outside workspace access",
-			`\`${toolName}\` targets a path outside the working directory:\n\n  Path: ${displayPath}\n  CWD:  ${cwd}\n\nAllow access?`,
-			{ timeout: 30000 },
-			compiled.boundary.aiReview
+		const asked = await askUser(ctx, {
+			tool: toolName, input: filePath, rule: "cwd-boundary", category: "boundary",
+			label: `Approval needed: outside-workspace access ${displayPath}`,
+			title: "⚠️ Outside workspace access",
+			body: `\`${toolName}\` targets a path outside the working directory:\n\n  Path: ${displayPath}\n  CWD:  ${cwd}\n\nAllow access?`,
+			timeoutMs: 30000,
+			ai: compiled.boundary.aiReview
 				? { tool: toolName, category: "boundary", rule: "cwd-boundary", payload: filePath, cwd, command }
 				: undefined,
-		);
-
-		if (!APPROVED.includes(res)) {
-			log({ tool: toolName, input: filePath, rule: "cwd-boundary", category: "boundary", action: res === "expired" ? "expired" : "blocked_by_user" });
-			return { block: true, reason: res === "expired" ? "Approval timed out for access outside working directory." : "User denied access outside working directory." };
-		}
-		// An AI approval is exact-payload only — it must not become a directory grant.
-		if (res === "ai_allowed") return undefined;
-
-		// Grant for session — grant the directory
-		const parentDir = path.dirname(resolved) + "/";
-		sessionBoundaryGrants.add(parentDir);
-		log({ tool: toolName, input: filePath, rule: "cwd-boundary", category: "boundary", action: "approved_by_user" });
-		return undefined;
+			// An AI approval is exact-payload only, so it never becomes a directory grant (askUser skips grant for it).
+			grant: () => sessionBoundaryGrants.add(path.dirname(resolved) + "/"),
+		});
+		if (asked.allowed) return undefined;
+		return { block: true, reason: asked.res === "expired" ? "Approval timed out for access outside working directory." : "User denied access outside working directory." };
 	}
 
 	// ── Session Start ─────────────────────────────────────────────────────────
@@ -779,12 +1014,15 @@ Reply with ONLY compact JSON: {"verdict":"allow"|"block","reason":"<20 words max
 				if (!ctx.hasUI) {
 					return { block: true, reason: `🛑 Cannot remove security rule "${ruleName}" — no UI available. Rules can only be removed with terminal approval.` };
 				}
-				const res = await confirmBlocked(ctx, `Approval needed: remove security rule "${ruleName}"`, "🛡️ Remove security rule?", confirmMsg, { timeout: 60000 });
-				if (res !== "yes") {
-					log({ tool: "security_manage", input: `remove: ${ruleName}`, rule: ruleName, category: `${input.scope}.${input.category}`, action: res === "expired" ? "expired" : "blocked_by_user" });
+				const asked = await askUser(ctx, {
+					tool: "security_manage", input: `remove: ${ruleName}`, rule: ruleName, category: `${input.scope}.${input.category}`,
+					label: `Approval needed: remove security rule "${ruleName}"`, title: "🛡️ Remove security rule?", body: confirmMsg,
+					timeoutMs: 60000,
+					terminalOnly: true, // terminal-only on purpose: rule removal must never be answerable from the phone
+				});
+				if (!asked.allowed) {
 					return { block: true, reason: `🚫 User denied removal of security rule "${ruleName}". The rule remains active. Do NOT retry or attempt to work around this.` };
 				}
-				log({ tool: "security_manage", input: `remove: ${ruleName}`, rule: ruleName, category: `${input.scope}.${input.category}`, action: "approved_by_user" });
 				return undefined;
 			}
 			return undefined;
@@ -880,30 +1118,21 @@ Reply with ONLY compact JSON: {"verdict":"allow"|"block","reason":"<20 words max
 						emitBlocked(toolName, cmd, rule.description, "bash.ask");
 						return { block: true, reason: blockReason(`${rule.description} (no UI to confirm)`, rule.guidance) };
 					}
-					const res = await confirmBlocked(
-						ctx,
-						`Approval needed: ${rule.description}`,
-						`⚠️ Security: ${rule.description}`,
-						confirmBody(cmd, rule.guidance),
-						{ timeout: 30000 },
-						rule.aiReview
+					const asked = await askUser(ctx, {
+						tool: toolName, input: cmd, rule: rule.description, category: "bash.ask",
+						label: `Approval needed: ${rule.description}`,
+						title: `⚠️ Security: ${rule.description}`,
+						body: confirmBody(cmd, rule.guidance),
+						timeoutMs: 30000,
+						announceDenial: true,
+						ai: rule.aiReview
 							? { tool: toolName, category: "bash.ask", rule: rule.description, payload: cmd, cwd: ctx.cwd }
 							: undefined,
-					);
-					if (!APPROVED.includes(res)) {
-						ctx.ui.setStatus("security", `⚠️ ${res === "expired" ? "Timed out" : "Denied"}: ${rule.description}`);
-						log({ tool: toolName, input: cmd, rule: rule.description, category: "bash.ask", action: res === "expired" ? "expired" : "blocked_by_user" });
-						emitBlocked(toolName, cmd, rule.description, "bash.ask");
-						return { block: true, reason: blockReason(rule.description, rule.guidance) };
-					}
-					// Grant for session — approve this rule pattern for the rest of the session.
-					// Critical rules are excluded so one approval can never unsupervise them, and
-					// an AI approval grants nothing here at all (exact payload only, cached in judge()).
-					if (res === "yes") {
-						if (!isCritical(cmd)) sessionGrants.add(rule.pattern);
-						log({ tool: toolName, input: cmd, rule: rule.description, category: "bash.ask", action: "approved_by_user" });
-					}
-					return undefined;
+						// A human "yes" grants the rule for the rest of the session. Critical payloads are excluded so one
+						// approval can never unsupervise them; an AI approval grants nothing at all (exact payload only, cached in judge()).
+						grant: () => { if (!isCritical(cmd)) sessionGrants.add(rule.pattern); },
+					});
+					return asked.allowed ? undefined : { block: true, reason: blockReason(rule.description, rule.guidance) };
 				}
 			}
 
@@ -958,22 +1187,16 @@ Reply with ONLY compact JSON: {"verdict":"allow"|"block","reason":"<20 words max
 						emitBlocked(event.toolName, filePath, rule.description, "paths.askOnWrite");
 						return { block: true, reason: blockReason(`${rule.description} (no UI to confirm)`, rule.guidance) };
 					}
-					const res = await confirmBlocked(
-						ctx,
-						`Approval needed: ${rule.description}`,
-						`⚠️ Security: Modifying ${rule.description}`,
-						confirmPathBody(filePath, rule.guidance),
-						{ timeout: 30000 },
-					);
-					if (!APPROVED.includes(res)) {
-						ctx.ui.setStatus("security", `⚠️ ${res === "expired" ? "Timed out" : "Denied"}: ${rule.description}`);
-						log({ tool: event.toolName, input: filePath, rule: rule.description, category: "paths.askOnWrite", action: res === "expired" ? "expired" : "blocked_by_user" });
-						emitBlocked(event.toolName, filePath, rule.description, "paths.askOnWrite");
-						return { block: true, reason: blockReason(rule.description, rule.guidance) };
-					}
-					sessionGrants.add(rule.pattern);
-					log({ tool: event.toolName, input: filePath, rule: rule.description, category: "paths.askOnWrite", action: "approved_by_user" });
-					return undefined;
+					const asked = await askUser(ctx, {
+						tool: event.toolName, input: filePath, rule: rule.description, category: "paths.askOnWrite",
+						label: `Approval needed: ${rule.description}`,
+						title: `⚠️ Security: Modifying ${rule.description}`,
+						body: confirmPathBody(filePath, rule.guidance),
+						timeoutMs: 30000,
+						announceDenial: true,
+						grant: () => sessionGrants.add(rule.pattern),
+					});
+					return asked.allowed ? undefined : { block: true, reason: blockReason(rule.description, rule.guidance) };
 				}
 			}
 

@@ -1,0 +1,39 @@
+{
+  "bash": {
+    "prohibit": [
+      {
+        "pattern": "\\bfoo-wipe\\b",
+        "description": "fixture hard block"
+      }
+    ],
+    "ask": [
+      {
+        "pattern": "\\bfoo-deploy\\b",
+        "description": "fixture deploy",
+        "guidance": "Ask first."
+      },
+      {
+        "pattern": "\\bfoo-review\\b",
+        "description": "fixture reviewed",
+        "aiReview": true
+      }
+    ]
+  },
+  "paths": {
+    "zeroAccess": [],
+    "readOnly": [],
+    "noDelete": [],
+    "askOnWrite": [
+      {
+        "pattern": "\\.fixture-ask$",
+        "description": "fixture ask file",
+        "guidance": "Ask first."
+      }
+    ]
+  },
+  "boundary": {
+    "enabled": false,
+    "mode": "ask",
+    "allowedPaths": []
+  }
+}

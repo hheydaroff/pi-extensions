@@ -1,0 +1,17 @@
+{
+  "bash": {
+    "prohibit": [],
+    "ask": []
+  },
+  "paths": {
+    "zeroAccess": [],
+    "readOnly": [],
+    "noDelete": [],
+    "askOnWrite": []
+  },
+  "boundary": {
+    "enabled": true,
+    "mode": "ask",
+    "allowedPaths": []
+  }
+}
