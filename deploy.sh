@@ -36,6 +36,7 @@ EXCLUDES=(
   --exclude='deploy.sh'
   --exclude='tests/'
   --exclude='README.md'
+  --exclude='AGENTS.md'
   --exclude='node_modules/'
   --exclude='herdr-agent-state.ts'   # owner: `herdr integration install pi`
   --exclude='.pi-subagents/'         # owner: pi-subagents (missions + artifacts)

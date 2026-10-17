@@ -31,6 +31,7 @@ After deploying, run `/reload` inside pi (or restart) to pick up changes.
 | **`radio-garden.ts`** | `/radio` — listen to live radio from [radio.garden](https://radio.garden). Random station, search by name, or browse by city/country. Shows the current station in a sticky footer widget. Requires `mpv` or `ffplay`. |
 | **`image-eyes.ts`** | Gives text-only models eyes. When the active model can't see images, pasted image paths / attachments are converted to precise text instead of being dropped: a vision LLM (pinned to EU Claude Haiku 5.5, override via `IMAGE_EYES_MODEL="provider/id"`) describes layout/position/colors/sizes query-aware, and local Apple-Vision OCR appends exact text. Adds `/look <path>` and a `look` tool for follow-up details. Invisible on vision-capable models. |
 | **`dashscope-image.ts`** | `generate_image` tool + `/image` command for DashScope image generation: qwen-image-3.0 / qwen-image-3.0-pro (text-to-image + image-to-image, sync) and wan2.6-image (image editing / subject-consistency, async). Saves PNGs to the CWD. Auth + endpoint are auto-derived from the `dashscope` provider in `models.json` (override via `dashscope-image` in settings.json). |
+| **`add-agent-md.ts`** | `/add-agent-md [name]` — install an AGENTS.md template from `~/.pi/agent/agent-md/` into the current project. |
 | **`pocket-tts.ts`** | `/voice` — text-to-speech voice output of assistant replies using a configurable TTS model. |
 
 ### Memory & Sessions
@@ -38,6 +39,7 @@ After deploying, run `/reload` inside pi (or restart) to pick up changes.
 | Extension | What it does |
 |---|---|
 | **`vault-memory.ts`** | `vault_memory` tool — persistent agent memory stored as markdown in `~/.pi/agent/pi-memory/`. Read, write, update, and list facts/preferences across sessions. |
+| **`dream.ts`** | `/dream status\|plan\|apply\|model` — manual memory consolidation. Engine in `dream/dream.py`; the model only returns text, the script validates and applies, one git commit per apply. |
 | **`session-summary.ts`** | Auto-saves a conversation summary (highlights, tools used, files modified) to the vault memory path when a session ends or switches. |
 | **`auto-skill.ts`** | After a complex multi-step task, *proposes* (never auto-creates) a reusable pi skill. Only written after you explicitly accept. |
 
@@ -46,10 +48,14 @@ After deploying, run `/reload` inside pi (or restart) to pick up changes.
 | Extension | What it does |
 |---|---|
 | **`review.ts`** | `/review` — code review command (inspired by Codex). Review a GitHub PR, a base branch, uncommitted changes, a specific commit, or a folder snapshot. Supports shared custom review instructions and a loop-fixing mode. |
+| **`cost-tracker.ts`** | Logs per-project AI spend to `~/.pi/agent/cost-log.jsonl`; `/costs` shows spend grouped by project and model. |
+| **`herdr-subagent/`** | `herdr-subagent` CLI + skill: run a separate pi agent in a visible Herdr pane. Live test suite in the folder. |
 | **`cron-scheduler.ts`** | `cron_schedule` tool — schedule recurring/one-shot prompts (standard 5-field cron, or `once`). Jobs persist in `~/.pi/agent/cron-jobs.json` and deliver results via Signal. |
 | **`spool.ts`** | Keeps oversized tool output out of context. Transparently spools large results to disk + FTS5 index, replacing them with a compact pointer. Adds `spool_run`, `spool_index`, `spool_search`, `spool_get` and `/spool`. |
 | **`update-checker.ts`** | Checks npm for a newer pi release and surfaces the right install command for your package manager. |
 | **`update-local-models.ts`** | `/update-local-models` — sync locally served models (e.g. LM Studio / Ollama) into `~/.pi/agent/models.json`. |
+| **`content-filter-repair.ts`** | On a DashScope content-filter error, finds the flagged history message(s), rewords them with Haiku, and retries (raw history untouched). |
+| **`dashscope-quota-retry.ts`** | Reclassifies DashScope's transient 429 `insufficient_quota` burst limit as retryable so pi's built-in retry/backoff runs. |
 | **`tool-counter.ts`** | Rich two-line custom footer: model + context meter + token/cost on top, cwd/branch + per-tool call tally below. Good `setFooter` reference. |
 
 ### Security & Safety

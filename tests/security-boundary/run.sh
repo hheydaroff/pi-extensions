@@ -21,4 +21,5 @@ npx --no-install esbuild ../../security.ts \
   --external:@earendil-works/pi-ai \
   --outfile=sec-ext.cjs
 
-node harness.cjs
+# hard cap: a deadlocked fake-timer test must not hang the session (macOS has no `timeout`)
+perl -e 'alarm 120; exec @ARGV' node harness.cjs

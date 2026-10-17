@@ -12,4 +12,3 @@ tests/vault-memory-lock/vm-ext.cjs
 tests/vault-memory-lock/scratch-home/
 # Private internal design doc — local only, never commit.
 AI-REVIEW-WORKFLOW.md
-tests/remote-approval/sec-ext.cjs

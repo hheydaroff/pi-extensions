@@ -17,4 +17,4 @@ npx --no-install esbuild ../../vault-memory.ts \
   --external:@sinclair/typebox \
   --outfile=vm-ext.cjs
 
-node harness.cjs run
+perl -e 'alarm 120; exec @ARGV' node harness.cjs run
